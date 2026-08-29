@@ -72,7 +72,7 @@ const server = http.createServer((req, res) => {
     return json(res, 200, {
       ok: true,
       extensionClients: [...clients].filter(ws => ws.readyState === WebSocket.OPEN).length,
-      protocolVersion: 2,
+      protocolVersion: 3,
       profilePolicy: 'current_connected_browser_profile_only'
     });
   }
@@ -101,7 +101,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (req.method === 'POST' && (url.pathname === '/open' || url.pathname === '/send')) {
+  if (req.method === 'POST' && (url.pathname === '/open' || url.pathname === '/close' || url.pathname === '/send')) {
     let body = '';
     req.setEncoding('utf8');
     req.on('data', chunk => {
@@ -133,11 +133,22 @@ const server = http.createServer((req, res) => {
         return;
       }
 
+      if (url.pathname === '/close') {
+        const tabId = Number.isInteger(data.tabId) ? data.tabId : undefined;
+        if (!Number.isInteger(tabId)) {
+          return json(res, 400, { ok: false, error: 'tabId is required.' });
+        }
+        awaitResult(id, 'close-result', res, 8000);
+        sendToCurrentProfile(JSON.stringify({ type: 'close-tab', id, tabId }));
+        return;
+      }
+
       const text = String(data.text || '').trim();
       if (!text) return json(res, 400, { ok: false, error: 'text is required.' });
       const tabId = Number.isInteger(data.tabId) ? data.tabId : undefined;
+      const commandId = String(data.commandId || '').trim().slice(0, 128);
       awaitResult(id, 'send-result', res, 8000);
-      sendToCurrentProfile(JSON.stringify({ type: 'send', id, tabId, text }));
+      sendToCurrentProfile(JSON.stringify({ type: 'send', id, tabId, text, commandId }));
     });
     return;
   }

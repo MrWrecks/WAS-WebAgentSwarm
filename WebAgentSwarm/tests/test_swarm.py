@@ -41,7 +41,7 @@ class FakeBridge:
             },
         }
 
-    def send(self, tab_id, text):
+    def send(self, tab_id, text, command_id=""):
         self.sent.append((tab_id, text))
         for idx, tab in enumerate(self.tabs_data):
             if tab["id"] == tab_id and "/c/" not in tab["url"]:
@@ -49,7 +49,18 @@ class FakeBridge:
                     tab,
                     url="https://chatgpt.com/c/conversation-{0}".format(tab_id),
                 )
-        return {"ok": True, "tabId": tab_id}
+        return {"ok": True, "tabId": tab_id, "commandId": command_id}
+
+    def close_tab(self, tab_id):
+        before = len(self.tabs_data)
+        self.tabs_data = [
+            tab for tab in self.tabs_data
+            if int(tab.get("id", -1)) != int(tab_id)
+        ]
+        return {
+            "ok": len(self.tabs_data) < before,
+            "tabId": int(tab_id),
+        }
 
 
 class SwarmRuntimeTest(unittest.TestCase):
@@ -246,6 +257,81 @@ class SwarmRuntimeTest(unittest.TestCase):
                 set(store.bindings()),
                 {"main", "implementer", "debugger"},
             )
+
+    def test_external_wait_does_not_spawn_debugger_pressure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = FakeBridge()
+            store = DurableStore(Path(tmp))
+            swarm = SwarmRuntime(bridge=bridge, store=store)
+            store.task_create(
+                "Wait for extension",
+                owner="implementer",
+                task_id="wait-extension",
+            )
+            store.task_update(
+                "wait-extension",
+                status="blocked",
+                summary="external_wait: waiting for browser extension",
+            )
+
+            plan = swarm.coordination_plan(
+                active_roles=["implementer"],
+                max_new_roles=2,
+            )
+            node = next(
+                item for item in plan["task_nodes"]
+                if item["task_id"] == "wait-extension"
+            )
+            self.assertEqual(node["route"], "wait_external")
+            self.assertEqual(node["blocker_kind"], "external_wait")
+            self.assertNotIn("debugger", plan["scale_recommendation"]["add_roles"])
+
+    def test_elastic_scale_in_suspends_and_closes_idle_workers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = FakeBridge()
+            store = DurableStore(Path(tmp))
+            swarm = SwarmRuntime(bridge=bridge, store=store)
+            started = swarm.start(["implementer", "tester"], start_watch=False)
+            self.assertTrue(started["ok"])
+
+            plan = swarm.elastic_plan()
+            self.assertTrue(plan["needs_scale_in"])
+            scaled = swarm.scale(start_watch=False)
+            self.assertTrue(scaled["ok"])
+            self.assertTrue(scaled["scaled"])
+            self.assertEqual(set(scaled["removed_workers"]), {"implementer", "tester"})
+            self.assertEqual(scaled["worker_count"], 0)
+            bindings = store.bindings()
+            self.assertTrue(bindings["implementer"]["suspended"])
+            self.assertTrue(bindings["tester"]["suspended"])
+            self.assertEqual(
+                [tab for tab in bridge.tabs_data if "/c/" in str(tab.get("url") or "")],
+                [next(tab for tab in bridge.tabs_data if tab["id"] == 11)],
+            )
+
+    def test_scale_in_refuses_worker_with_live_task_lease(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = FakeBridge()
+            store = DurableStore(Path(tmp))
+            swarm = SwarmRuntime(bridge=bridge, store=store)
+            started = swarm.start(["implementer"], start_watch=False)
+            self.assertTrue(started["ok"])
+            store.task_create(
+                "leased work",
+                owner="implementer",
+                task_id="leased-work",
+            )
+            store.task_claim("leased-work", "implementer", lease_seconds=600)
+
+            scaled = swarm.scale(
+                requested_instances={"implementer": 0},
+                start_watch=False,
+            )
+            self.assertFalse(scaled["ok"])
+            self.assertEqual(scaled["removed_workers"], [])
+            self.assertTrue(scaled["scale_in_blocked"])
+            self.assertEqual(scaled["worker_instances"]["implementer"], 1)
+            self.assertFalse(store.bindings()["implementer"].get("suspended", False))
 
     def test_send_style_fanout_scales_multiple_instances_of_same_role(self):
         with tempfile.TemporaryDirectory() as tmp:

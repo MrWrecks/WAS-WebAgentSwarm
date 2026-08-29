@@ -41,7 +41,7 @@ def main(argv=None) -> int:
     start.add_argument("--instances", nargs="*", default=[])
     start.add_argument("--spawn-url", default="")
     start.add_argument("--no-watch", action="store_true")
-    start.add_argument("--interval", type=float, default=15.0)
+    start.add_argument("--interval", type=float, default=300.0)
     start.add_argument("--max-silence", type=float, default=300.0)
 
     coordination = sub.add_parser("coordination-plan")
@@ -61,7 +61,7 @@ def main(argv=None) -> int:
     scale.add_argument("--max-instances-per-role", type=int, default=4)
     scale.add_argument("--spawn-url", default="")
     scale.add_argument("--no-watch", action="store_true")
-    scale.add_argument("--interval", type=float, default=15.0)
+    scale.add_argument("--interval", type=float, default=300.0)
     scale.add_argument("--max-silence", type=float, default=300.0)
 
     send = sub.add_parser("send")
@@ -85,7 +85,7 @@ def main(argv=None) -> int:
     status.add_argument("value")
 
     watch = sub.add_parser("watch")
-    watch.add_argument("--interval", type=float, default=15.0)
+    watch.add_argument("--interval", type=float, default=300.0)
     watch.add_argument("--max-silence", type=float, default=300.0)
 
     args = parser.parse_args(argv)

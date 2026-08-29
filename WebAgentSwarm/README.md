@@ -15,9 +15,10 @@ when worker state changes.
 - Keep a small durable task board and shared status store outside chat history.
 - Recommend a worker count/role subset before opening browser tabs.
 - Derive dependency-aware conditional routes, fan-out frontiers, fan-in barriers, and interrupts from durable tasks.
-- Elastically add missing worker roles after startup as task mix or parallelism needs change.
-- Wake the main agent when worker/task state changes instead of waiting for a coarse timer.
-- Start that watcher automatically when a confirmed swarm is launched.
+- Elastically add or safely suspend worker instances as durable task pressure changes.
+- Poll durable swarm state every 5 minutes by default; UI-only idle/generating/message changes do not create semantic ticks.
+- Wake the main agent on durable task/superstep changes, actionable transport faults, or a 5-minute unresolved-work safety wake.
+- Start that watcher automatically when a confirmed swarm is launched, and restart it when watcher parameters change.
 - Optionally expose the same controls as MCP tools.
 - Bundle a clean-room CodexPro-compatible local development MCP for workspace inspection, edits, verification commands, background tasks, handoff, and context management.
 

@@ -4,6 +4,18 @@ let socket = null;
 let reconnectTimer = null;
 let keepAliveTimer = null;
 let connectInFlight = false;
+const commandResults = new Map();
+const commandInflight = new Map();
+const MAX_COMMAND_CACHE = 256;
+
+function rememberCommand(commandId, result) {
+  if (!commandId) return;
+  commandResults.set(commandId, result);
+  while (commandResults.size > MAX_COMMAND_CACHE) {
+    const oldest = commandResults.keys().next().value;
+    commandResults.delete(oldest);
+  }
+}
 
 async function getWsUrl() {
   const result = await chrome.storage.local.get(['bridgeWsUrl']);
@@ -124,39 +136,68 @@ async function inspect(payload) {
   }
 }
 
+async function performSend(tab, payload) {
+  try {
+    const result = await callContent(tab, {
+      type: 'send-chatgpt-message',
+      text: payload.text
+    });
+    return {
+      ok: Boolean(result?.ok),
+      error: result?.error || null,
+      tabId: tab.id,
+      tabTitle: tab.title || '',
+      tabUrl: tab.url || '',
+      commandId: String(payload.commandId || '')
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: String(error),
+      tabId: tab?.id,
+      commandId: String(payload.commandId || '')
+    };
+  }
+}
+
 async function send(payload) {
+  const commandId = String(payload.commandId || '').trim();
+  if (commandId && commandResults.has(commandId)) {
+    sendSocket({
+      type: 'send-result',
+      id: payload.id,
+      ...commandResults.get(commandId),
+      duplicate: true
+    });
+    return;
+  }
+
+  if (commandId && commandInflight.has(commandId)) {
+    const result = await commandInflight.get(commandId);
+    sendSocket({ type: 'send-result', id: payload.id, ...result, duplicate: true });
+    return;
+  }
+
   const tab = await resolveChatTab(payload.tabId);
   if (!tab?.id) {
     sendSocket({
       type: 'send-result',
       id: payload.id,
       ok: false,
-      error: 'Target tab was not found or is not ChatGPT.'
+      error: 'Target tab was not found or is not ChatGPT.',
+      commandId
     });
     return;
   }
-  try {
-    const result = await callContent(tab, {
-      type: 'send-chatgpt-message',
-      text: payload.text
-    });
-    sendSocket({
-      type: 'send-result',
-      id: payload.id,
-      ok: Boolean(result?.ok),
-      error: result?.error || null,
-      tabId: tab.id,
-      tabTitle: tab.title || '',
-      tabUrl: tab.url || ''
-    });
-  } catch (error) {
-    sendSocket({
-      type: 'send-result',
-      id: payload.id,
-      ok: false,
-      error: String(error)
-    });
+
+  const work = performSend(tab, payload);
+  if (commandId) commandInflight.set(commandId, work);
+  const result = await work;
+  if (commandId) {
+    commandInflight.delete(commandId);
+    rememberCommand(commandId, result);
   }
+  sendSocket({ type: 'send-result', id: payload.id, ...result, duplicate: false });
 }
 
 async function connect() {
@@ -247,6 +288,28 @@ async function connect() {
       } catch (error) {
         sendSocket({
           type: 'open-result',
+          id: payload.id,
+          ok: false,
+          error: String(error)
+        });
+      }
+      return;
+    }
+
+    if (payload.type === 'close-tab') {
+      try {
+        const tab = await resolveChatTab(payload.tabId);
+        if (!tab?.id) throw new Error('Target tab was not found or is not ChatGPT.');
+        await chrome.tabs.remove(tab.id);
+        sendSocket({
+          type: 'close-result',
+          id: payload.id,
+          ok: true,
+          tabId: tab.id
+        });
+      } catch (error) {
+        sendSocket({
+          type: 'close-result',
           id: payload.id,
           ok: false,
           error: String(error)

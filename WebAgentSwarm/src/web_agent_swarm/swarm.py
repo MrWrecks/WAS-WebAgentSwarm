@@ -1,10 +1,13 @@
 """Browser-hosted swarm runtime."""
 
+import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
+import uuid
 from typing import Dict, List, Optional
 
 from .bridge import BridgeClient
@@ -34,6 +37,7 @@ class SwarmRuntime:
         self.bridge = bridge or BridgeClient()
         self.store = store or DurableStore()
         self.watcher_pid_path = self.store.root / "watcher.pid"
+        self.watcher_config_path = self.store.root / "watcher.json"
         self.watcher_log_path = self.store.root / "watcher.log"
 
     def plan(
@@ -149,11 +153,65 @@ class SwarmRuntime:
         return result
 
     @staticmethod
-    def _task_role(task: Dict[str, object]) -> str:
+    def _blocker_kind(
+        task: Dict[str, object],
+        unresolved_dependencies: Optional[List[str]] = None,
+    ) -> str:
+        if unresolved_dependencies:
+            return "dependency_wait"
+
+        text = " ".join([
+            str(task.get("blocker") or ""),
+            str(task.get("summary") or ""),
+            str(task.get("last_error") or ""),
+        ]).strip().lower()
+        explicit = {
+            "dependency_wait",
+            "external_wait",
+            "human_input",
+            "verification_failure",
+            "recoverable_failure",
+            "unknown_blocker",
+        }
+        for kind in explicit:
+            if text.startswith(kind + ":"):
+                return kind
+        if any(token in text for token in (
+            "human input", "user input", "approval", "confirmation",
+            "人工", "用户确认", "等待用户",
+        )):
+            return "human_input"
+        if any(token in text for token in (
+            "extension", "browser", "network", "connection", "license",
+            "schema unavailable", "tool unavailable", "连接", "网络", "许可证",
+        )):
+            return "external_wait"
+        if any(token in text for token in (
+            "test failed", "test failure", "verification", "regression",
+            "verify", "验证失败", "回归失败",
+        )):
+            return "verification_failure"
+        if any(token in text for token in (
+            "timeout", "timed out", "crash", "exception", "stuck", "retry",
+            "超时", "崩溃", "异常", "卡死", "重试",
+        )):
+            return "recoverable_failure"
+        return "unknown_blocker"
+
+    @classmethod
+    def _task_role(
+        cls,
+        task: Dict[str, object],
+        blocker_kind: str = "",
+    ) -> str:
         status = str(task.get("status") or "").strip().lower()
         if status == "review":
             return "reviewer"
-        if status == "blocked":
+        if status == "blocked" and blocker_kind in {
+            "verification_failure",
+            "recoverable_failure",
+            "unknown_blocker",
+        }:
             return "debugger"
         owner = str(task.get("owner") or "").strip().lower()
         if owner in DEFAULT_ROLES:
@@ -163,7 +221,7 @@ class SwarmRuntime:
     def _bound_worker_instances(self) -> Dict[str, List[str]]:
         instances = {role: [] for role in DEFAULT_ROLES}
         for name, binding in self.store.bindings().items():
-            if name == "main" or not isinstance(binding, dict):
+            if name == "main" or not isinstance(binding, dict) or binding.get("suspended"):
                 continue
             role = str(binding.get("role") or "").strip().lower()
             if role in DEFAULT_ROLES:
@@ -227,6 +285,7 @@ class SwarmRuntime:
         edges = []
         frontier = []
         barriers = []
+        waits = []
         interrupts = []
         pressure = {
             role: {
@@ -246,7 +305,6 @@ class SwarmRuntime:
                 continue
             task_id = str(task.get("task_id") or "")
             status = str(task.get("status") or "").strip().lower()
-            role = self._task_role(task)
             dependencies = [
                 str(item)
                 for item in task.get("dependencies", [])
@@ -257,6 +315,12 @@ class SwarmRuntime:
                 for dep in dependencies
                 if task_map.get(dep, {}).get("status") != "done"
             ]
+            blocker_kind = (
+                self._blocker_kind(task, unresolved)
+                if status == "blocked"
+                else ""
+            )
+            role = self._task_role(task, blocker_kind=blocker_kind)
             for dep in dependencies:
                 edges.append({"from": dep, "to": task_id, "kind": "dependency"})
 
@@ -270,16 +334,30 @@ class SwarmRuntime:
             executable = False
 
             if status == "blocked":
-                route = "interrupt"
-                interrupts.append({
+                blocked_record = {
                     "kind": "blocked_task",
+                    "blocker_kind": blocker_kind,
                     "task_id": task_id,
                     "role": role,
                     "summary": str(task.get("summary") or ""),
-                })
-                pressure[role]["score"] += 40
-                pressure[role]["interrupt_task_ids"].append(task_id)
-                pressure[role]["reasons"].append("blocked task {0}".format(task_id))
+                }
+                if blocker_kind == "dependency_wait":
+                    route = "wait_dependencies"
+                    waits.append(blocked_record)
+                elif blocker_kind == "external_wait":
+                    route = "wait_external"
+                    waits.append(blocked_record)
+                elif blocker_kind == "human_input":
+                    route = "interrupt_human"
+                    interrupts.append(blocked_record)
+                else:
+                    route = "interrupt"
+                    interrupts.append(blocked_record)
+                    pressure[role]["score"] += 40
+                    pressure[role]["interrupt_task_ids"].append(task_id)
+                    pressure[role]["reasons"].append(
+                        "{0} task {1}".format(blocker_kind, task_id)
+                    )
             elif status == "ready" and unresolved:
                 route = "wait_dependencies"
             elif retry_wait:
@@ -329,6 +407,7 @@ class SwarmRuntime:
                 "status": status,
                 "route": route,
                 "executable": executable,
+                "blocker_kind": blocker_kind,
                 "dependencies": dependencies,
                 "unresolved_dependencies": unresolved,
                 "claimed_by": claimed_by,
@@ -353,6 +432,10 @@ class SwarmRuntime:
             row["missing_instances"] = max(
                 0,
                 int(row["desired_instances"]) - int(row["current_instances"]),
+            )
+            row["excess_instances"] = max(
+                0,
+                int(row["current_instances"]) - int(row["desired_instances"]),
             )
 
         ranked = sorted(
@@ -385,10 +468,30 @@ class SwarmRuntime:
             for item in add_instances
             if int(item["current_instances"]) == 0
         ]
+        remove_instances = [
+            {
+                "role": str(item["role"]),
+                "count": int(item["excess_instances"]),
+                "current_instances": int(item["current_instances"]),
+                "desired_instances": int(item["desired_instances"]),
+            }
+            for item in ranked
+            if int(item["excess_instances"]) > 0
+        ]
+        remove_roles = [
+            item["role"]
+            for item in remove_instances
+            if int(item["desired_instances"]) == 0
+        ]
         recommended_instances = dict(active_instances)
         for item in add_instances:
             recommended_instances[item["role"]] = (
                 int(recommended_instances.get(item["role"], 0)) + int(item["count"])
+            )
+        for item in remove_instances:
+            recommended_instances[item["role"]] = max(
+                0,
+                int(recommended_instances.get(item["role"], 0)) - int(item["count"]),
             )
 
         return {
@@ -415,16 +518,24 @@ class SwarmRuntime:
             "dependency_edges": edges,
             "parallel_frontier": frontier,
             "fan_in_barriers": barriers,
+            "waits": waits,
             "interrupts": interrupts,
             "role_pressure": ranked,
             "scale_recommendation": {
-                "needs_scale": bool(add_instances),
+                "needs_scale": bool(add_instances or remove_instances),
+                "needs_scale_out": bool(add_instances),
+                "needs_scale_in": bool(remove_instances),
                 "add_roles": add_roles,
                 "add_instances": add_instances,
+                "remove_roles": remove_roles,
+                "remove_instances": remove_instances,
                 "max_new_workers": add_limit,
                 "max_instances_per_role": per_role_limit,
                 "recommended_instances": recommended_instances,
-                "basis": "claimable + leased + interrupt work units by role",
+                "basis": (
+                    "desired instances from claimable + leased + actionable interrupt work; "
+                    "excess instances are eligible for safe scale-in"
+                ),
             },
         }
 
@@ -448,12 +559,17 @@ class SwarmRuntime:
             "active_roles": list(coordination.get("active_roles") or []),
             "active_instances": dict(coordination.get("active_instances") or {}),
             "needs_scale": bool(recommendation.get("needs_scale")),
+            "needs_scale_out": bool(recommendation.get("needs_scale_out")),
+            "needs_scale_in": bool(recommendation.get("needs_scale_in")),
             "add_roles": list(recommendation.get("add_roles") or []),
             "add_instances": list(recommendation.get("add_instances") or []),
+            "remove_roles": list(recommendation.get("remove_roles") or []),
+            "remove_instances": list(recommendation.get("remove_instances") or []),
             "coordination": coordination,
             "policy": (
-                "Scale from durable runnable-shard pressure and leases; multiple workers may "
-                "share one role. Browser idle alone is never a scale signal."
+                "Scale out from durable runnable-shard pressure and leases; scale in only "
+                "durably idle workers after lease/superstep/UI safety checks. Browser idle "
+                "alone is never a scale signal."
             ),
         }
 
@@ -469,7 +585,7 @@ class SwarmRuntime:
 
     def _resolve(self, name: str) -> Optional[Dict[str, object]]:
         binding = self.store.bindings().get(name)
-        if not isinstance(binding, dict):
+        if not isinstance(binding, dict) or binding.get("suspended"):
             return None
         cid = str(binding.get("conversation_id") or "")
         if not cid:
@@ -544,8 +660,9 @@ class SwarmRuntime:
             "pending task_release/status_set writes, and call swarm_superstep_commit only when "
             "the barrier reports ready_to_commit; any worker failure must abort the round. "
             "Workers must claim/lease tasks before concrete work. Use web_agent_swarm_elastic_plan "
-            "to compare runnable shard pressure with active instance counts, then "
-            "web_agent_swarm_scale when extra same-role or missing-role workers are justified. "
+            "to compare durable work pressure with active instance counts, then apply "
+            "web_agent_swarm_scale for recommended add_instances or remove_instances. Scale-in "
+            "must preserve bindings and refuse workers with live leases/supersteps/generation. "
             "Never scale merely because a browser tab is idle. Do not interrupt generating "
             "workers. Send one concise instruction per durable next action and avoid duplicate "
             "instructions. If CodexPro-style local development tools are available, use them "
@@ -557,19 +674,41 @@ class SwarmRuntime:
         tab_id: int,
         text: str,
         timeout: float = 20.0,
+        command_id: str = "",
     ) -> Dict[str, object]:
-        deadline = time.time() + timeout
-        last = {"ok": False, "error": "send timed out"}
+        deadline = time.time() + max(1.0, float(timeout))
+        active_command_id = str(command_id or "").strip() or uuid.uuid4().hex
+        last = {
+            "ok": False,
+            "error": "send timed out",
+            "command_id": active_command_id,
+        }
+        delay = 0.25
+        attempts = 0
         while time.time() < deadline:
             inspected = self.bridge.inspect(tab_id, tail=1)
             if inspected.get("ok"):
                 snapshot = inspected.get("snapshot") or {}
                 if snapshot.get("generating"):
-                    return {"ok": False, "busy": True, "error": "tab is generating"}
-            last = self.bridge.send(tab_id, text)
+                    return {
+                        "ok": False,
+                        "busy": True,
+                        "stuck_generating": bool(snapshot.get("stuckGenerating")),
+                        "command_id": active_command_id,
+                        "error": "tab is generating",
+                    }
+            attempts += 1
+            last = self.bridge.send(
+                tab_id,
+                text,
+                command_id=active_command_id,
+            )
+            last["command_id"] = active_command_id
+            last["attempts"] = attempts
             if last.get("ok"):
                 return last
-            time.sleep(0.5)
+            time.sleep(delay)
+            delay = min(delay * 2.0, 2.0)
         return last
 
     def _wait_conversation(self, tab_id: int, timeout: float = 20.0) -> Optional[Dict[str, object]]:
@@ -592,20 +731,53 @@ class SwarmRuntime:
 
     def ensure_watcher(
         self,
-        interval: float = 15.0,
+        interval: float = 300.0,
         max_silence: float = 300.0,
     ) -> Dict[str, object]:
+        desired = {
+            "interval": max(2.0, float(interval)),
+            "max_silence": max(0.0, float(max_silence)),
+        }
+        pid = 0
         if self.watcher_pid_path.is_file():
             try:
                 pid = int(self.watcher_pid_path.read_text(encoding="utf-8").strip())
             except (OSError, ValueError):
                 pid = 0
-            if pid and self._pid_alive(pid):
+
+        restarted = False
+        if pid and self._pid_alive(pid):
+            current = {}
+            if self.watcher_config_path.is_file():
+                try:
+                    loaded = json.loads(self.watcher_config_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        current = loaded
+                except (OSError, ValueError):
+                    current = {}
+            if current == desired:
                 return {
                     "ok": True,
                     "already_running": True,
                     "pid": pid,
+                    "config": desired,
                     "log": str(self.watcher_log_path),
+                }
+
+            restarted = True
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+            deadline = time.time() + 2.0
+            while time.time() < deadline and self._pid_alive(pid):
+                time.sleep(0.05)
+            if self._pid_alive(pid):
+                return {
+                    "ok": False,
+                    "error": "watcher config changed but old watcher could not be stopped",
+                    "pid": pid,
+                    "config": current,
                 }
 
         self.store.root.mkdir(parents=True, exist_ok=True)
@@ -614,9 +786,9 @@ class SwarmRuntime:
             "-m",
             "web_agent_swarm.watcher",
             "--interval",
-            str(max(2.0, float(interval))),
+            str(desired["interval"]),
             "--max-silence",
-            str(max(0.0, float(max_silence))),
+            str(desired["max_silence"]),
         ]
         kwargs = {
             "cwd": os.getcwd(),
@@ -635,11 +807,128 @@ class SwarmRuntime:
                 **kwargs
             )
         self.watcher_pid_path.write_text(str(process.pid) + "\n", encoding="utf-8")
+        self.watcher_config_path.write_text(
+            json.dumps(desired, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         return {
             "ok": True,
             "already_running": False,
+            "restarted": restarted,
             "pid": process.pid,
+            "config": desired,
             "log": str(self.watcher_log_path),
+        }
+
+    def _worker_suspend_guard(self, name: str) -> Dict[str, object]:
+        clean_name = str(name or "").strip()
+        if not clean_name or clean_name == "main":
+            return {
+                "ok": False,
+                "name": clean_name,
+                "reasons": ["main_or_invalid_worker"],
+            }
+
+        now = time.time()
+        tasks = self.store.tasks()
+        leased_tasks = [
+            str(task.get("task_id") or "")
+            for task in tasks
+            if isinstance(task, dict)
+            and str(task.get("status") or "").lower() == "active"
+            and str(task.get("claimed_by") or "") == clean_name
+            and float(task.get("lease_expires_at") or 0.0) > now
+        ]
+        active_steps = [
+            str(step.get("step_id") or "")
+            for step in self.store.supersteps(include_pending=False)
+            if isinstance(step, dict)
+            and step.get("status") in {"open", "ready"}
+            and clean_name in list(step.get("participants") or [])
+        ]
+        reasons = []
+        if leased_tasks:
+            reasons.append("active_task_lease")
+        if active_steps:
+            reasons.append("active_superstep")
+        return {
+            "ok": not reasons,
+            "name": clean_name,
+            "reasons": reasons,
+            "leased_task_ids": leased_tasks,
+            "active_supersteps": active_steps,
+        }
+
+    def suspend(self, name: str, close_tab: bool = True) -> Dict[str, object]:
+        clean_name = str(name or "").strip()
+        binding = self.store.bindings().get(clean_name)
+        if clean_name == "main" or not isinstance(binding, dict):
+            return {
+                "ok": False,
+                "name": clean_name,
+                "error": "worker binding not found or main cannot be suspended",
+            }
+        if binding.get("suspended"):
+            return {
+                "ok": True,
+                "name": clean_name,
+                "suspended": True,
+                "already_suspended": True,
+                "tab_closed": False,
+            }
+
+        guard = self._worker_suspend_guard(clean_name)
+        if not guard.get("ok"):
+            return {
+                "ok": False,
+                "name": clean_name,
+                "safe_to_suspend": False,
+                "guard": guard,
+                "error": "worker owns an active durable lease/superstep",
+            }
+
+        tab = self._resolve(clean_name)
+        if tab:
+            inspected = self.bridge.inspect(int(tab["id"]), tail=1)
+            if not inspected.get("ok"):
+                return {
+                    "ok": False,
+                    "name": clean_name,
+                    "safe_to_suspend": False,
+                    "error": inspected.get("error") or "worker tab state could not be inspected",
+                }
+            snapshot = inspected.get("snapshot") or {}
+            if snapshot.get("generating"):
+                return {
+                    "ok": False,
+                    "name": clean_name,
+                    "safe_to_suspend": False,
+                    "stuck_generating": bool(snapshot.get("stuckGenerating")),
+                    "error": "worker tab is generating",
+                }
+            if close_tab:
+                closed = self.bridge.close_tab(int(tab["id"]))
+                if not closed.get("ok"):
+                    return {
+                        "ok": False,
+                        "name": clean_name,
+                        "safe_to_suspend": False,
+                        "error": closed.get("error") or "failed to close worker tab",
+                    }
+
+        updated = dict(binding)
+        updated["suspended"] = True
+        updated["suspended_at"] = time.time()
+        if tab and str(tab.get("url") or ""):
+            updated["url_at_bind"] = str(tab.get("url") or "")
+        self.store.bind(clean_name, updated)
+        return {
+            "ok": True,
+            "name": clean_name,
+            "role": str(updated.get("role") or ""),
+            "suspended": True,
+            "tab_closed": bool(tab and close_tab),
+            "guard": guard,
         }
 
     def _spawn_worker_instance(
@@ -651,14 +940,31 @@ class SwarmRuntime:
         if clean_role not in DEFAULT_ROLES:
             return {"ok": False, "error": "unknown role: {0}".format(clean_role)}
         bindings = self.store.bindings()
-        name = self._next_worker_name(clean_role, bindings)
-        opened = self.bridge.open_tab(target_url, active=False)
+        suspended_names = sorted(
+            str(name)
+            for name, binding in bindings.items()
+            if isinstance(binding, dict)
+            and binding.get("suspended")
+            and str(binding.get("role") or "").strip().lower() == clean_role
+        )
+        name = (
+            suspended_names[0]
+            if suspended_names
+            else self._next_worker_name(clean_role, bindings)
+        )
+        existing = bindings.get(name)
+        reopen_url = (
+            str(existing.get("url_at_bind") or "")
+            if isinstance(existing, dict)
+            else ""
+        )
+        opened = self.bridge.open_tab(reopen_url or target_url, active=False)
         if not opened.get("ok") or not opened.get("tab"):
             return {
                 "ok": False,
                 "name": name,
                 "role": clean_role,
-                "action": "create_failed",
+                "action": "resume_failed" if reopen_url else "create_failed",
                 "error": opened.get("error"),
             }
         tab = opened["tab"]
@@ -671,7 +977,7 @@ class SwarmRuntime:
                 "ok": False,
                 "name": name,
                 "role": clean_role,
-                "action": "created",
+                "action": "resumed" if reopen_url else "created",
                 "error": sent.get("error"),
             }
         stable = self._wait_conversation(int(tab["id"]))
@@ -680,7 +986,7 @@ class SwarmRuntime:
                 "ok": False,
                 "name": name,
                 "role": clean_role,
-                "action": "created",
+                "action": "resumed" if reopen_url else "created",
                 "error": "conversation URL did not stabilize",
             }
         self._bind(name, stable, "worker", clean_role)
@@ -689,7 +995,7 @@ class SwarmRuntime:
             "name": name,
             "role": clean_role,
             "kind": "worker",
-            "action": "created",
+            "action": "resumed" if reopen_url else "created",
             "tab": stable,
         }
 
@@ -699,7 +1005,7 @@ class SwarmRuntime:
         instances: Optional[Dict[str, int]] = None,
         spawn_url: str = "",
         start_watch: bool = True,
-        interval: float = 15.0,
+        interval: float = 300.0,
         max_silence: float = 300.0,
     ) -> Dict[str, object]:
         selected = []
@@ -737,11 +1043,23 @@ class SwarmRuntime:
                 desired_worker_names.add(self._worker_instance_name(role, index))
 
         current = self.store.bindings()
-        for stale in list(current):
-            if stale == "main":
+        deactivated = []
+        deactivation_blocked = []
+        for stale, binding in current.items():
+            if stale == "main" or stale in desired_worker_names:
                 continue
-            if stale not in desired_worker_names:
-                self.store.unbind(stale)
+            if isinstance(binding, dict) and binding.get("suspended"):
+                continue
+            suspended = self.suspend(stale, close_tab=True)
+            if suspended.get("ok"):
+                deactivated.append(stale)
+            else:
+                deactivation_blocked.append({
+                    "name": stale,
+                    "error": suspended.get("error"),
+                    "guard": suspended.get("guard"),
+                    "stuck_generating": suspended.get("stuck_generating", False),
+                })
 
         tabs = self._tabs()
         target = str(spawn_url or "").strip() or self._spawn_url(tabs)
@@ -840,7 +1158,11 @@ class SwarmRuntime:
         )
         total_workers = sum(int(target_counts[role]) for role in selected)
         return {
-            "ok": all(item.get("ok") for item in records) and watcher.get("ok", False),
+            "ok": (
+                all(item.get("ok") for item in records)
+                and watcher.get("ok", False)
+                and not deactivation_blocked
+            ),
             "worker_roles": selected,
             "worker_instances": {
                 role: int(target_counts[role])
@@ -848,6 +1170,8 @@ class SwarmRuntime:
             },
             "worker_count": total_workers,
             "total_web_agents": total_workers + 1,
+            "deactivated_workers": deactivated,
+            "scale_in_blocked": deactivation_blocked,
             "agents": records,
             "watcher": watcher,
         }
@@ -861,10 +1185,10 @@ class SwarmRuntime:
         max_instances_per_role: int = 4,
         spawn_url: str = "",
         start_watch: bool = True,
-        interval: float = 15.0,
+        interval: float = 300.0,
         max_silence: float = 300.0,
     ) -> Dict[str, object]:
-        """Add missing-role or same-role worker instances without removing existing workers."""
+        """Scale worker instances in both directions using durable-pressure targets."""
         bindings = self.store.bindings()
         if "main" not in bindings:
             return {
@@ -877,29 +1201,27 @@ class SwarmRuntime:
             role: len(current_map.get(role, []))
             for role in DEFAULT_ROLES
         }
-        additions = {role: 0 for role in DEFAULT_ROLES}
+        target_counts = dict(current_counts)
+        elastic = None
 
-        if requested_instances:
+        if requested_instances is not None:
             for role, count in requested_instances.items():
                 clean = str(role or "").strip().lower()
                 if clean not in DEFAULT_ROLES:
                     return {"ok": False, "error": "unknown role: {0}".format(clean)}
-                target = max(0, min(int(count or 0), 16))
-                additions[clean] = max(0, target - int(current_counts.get(clean, 0)))
+                target_counts[clean] = max(0, min(int(count or 0), 16))
         elif requested_roles:
             for role in requested_roles:
                 clean = str(role or "").strip().lower()
                 if clean not in DEFAULT_ROLES:
                     return {"ok": False, "error": "unknown role: {0}".format(clean)}
-                if current_counts.get(clean, 0) == 0:
-                    additions[clean] = 1
+                target_counts[clean] = max(1, int(target_counts.get(clean, 0)))
         elif int(worker_count or 0):
             plan = plan_roles(self.store.tasks(), worker_count=worker_count)
             if not plan.get("ok"):
                 return plan
             for role in plan["roles"]:
-                if current_counts.get(role, 0) == 0:
-                    additions[role] = 1
+                target_counts[role] = max(1, int(target_counts.get(role, 0)))
         else:
             elastic = self.elastic_plan(
                 max_new_roles=max_new_roles,
@@ -907,39 +1229,69 @@ class SwarmRuntime:
             )
             if not elastic.get("ok"):
                 return elastic
-            for item in elastic.get("add_instances") or []:
-                role = str(item.get("role") or "")
-                if role in additions:
-                    additions[role] += max(0, int(item.get("count") or 0))
+            recommended = (
+                (elastic.get("coordination") or {})
+                .get("scale_recommendation", {})
+                .get("recommended_instances", {})
+            )
+            for role in DEFAULT_ROLES:
+                target_counts[role] = max(
+                    0,
+                    min(int(recommended.get(role, current_counts.get(role, 0)) or 0), 16),
+                )
+
+        additions = {
+            role: max(0, int(target_counts[role]) - int(current_counts[role]))
+            for role in DEFAULT_ROLES
+        }
+        removals = {
+            role: max(0, int(current_counts[role]) - int(target_counts[role]))
+            for role in DEFAULT_ROLES
+        }
+
+        removed_workers = []
+        scale_in_blocked = []
+        for role in DEFAULT_PRIORITY:
+            remaining = int(removals.get(role, 0))
+            if remaining <= 0:
+                continue
+            candidates = list(reversed(current_map.get(role, [])))
+            for name in candidates:
+                if remaining <= 0:
+                    break
+                result = self.suspend(name, close_tab=True)
+                if result.get("ok"):
+                    removed_workers.append(name)
+                    remaining -= 1
+                else:
+                    scale_in_blocked.append({
+                        "name": name,
+                        "role": role,
+                        "error": result.get("error"),
+                        "guard": result.get("guard"),
+                        "stuck_generating": result.get("stuck_generating", False),
+                    })
+            if remaining > 0:
+                scale_in_blocked.append({
+                    "role": role,
+                    "count_unmet": remaining,
+                    "error": "not enough safe worker instances were available for scale-in",
+                })
 
         requested_additions = [
-            {"role": role, "count": count}
+            {"role": role, "count": int(count)}
             for role, count in additions.items()
-            if count > 0
+            if int(count) > 0
         ]
-        if not requested_additions:
-            return {
-                "ok": True,
-                "scaled": False,
-                "added_roles": [],
-                "added_workers": [],
-                "added_instances": [],
-                "worker_roles": self._bound_worker_roles(),
-                "worker_instances": current_counts,
-                "worker_count": sum(current_counts.values()),
-                "total_web_agents": sum(current_counts.values()) + 1,
-                "coordination": self.coordination_plan(),
-            }
-
-        tabs = self._tabs()
-        target = str(spawn_url or "").strip() or self._spawn_url(tabs)
-        if not target.startswith("https://chatgpt.com/"):
-            return {"ok": False, "error": "spawn_url must be a chatgpt.com URL"}
-
         records = []
-        for item in requested_additions:
-            for _ in range(int(item["count"])):
-                records.append(self._spawn_worker_instance(item["role"], target))
+        if requested_additions:
+            tabs = self._tabs()
+            target = str(spawn_url or "").strip() or self._spawn_url(tabs)
+            if not target.startswith("https://chatgpt.com/"):
+                return {"ok": False, "error": "spawn_url must be a chatgpt.com URL"}
+            for item in requested_additions:
+                for _ in range(int(item["count"])):
+                    records.append(self._spawn_worker_instance(item["role"], target))
 
         watcher = (
             self.ensure_watcher(interval=interval, max_silence=max_silence)
@@ -967,8 +1319,12 @@ class SwarmRuntime:
                 actual_by_role.append({"role": role, "count": count})
 
         return {
-            "ok": all(item.get("ok") for item in records) and watcher.get("ok", False),
-            "scaled": bool(added_workers),
+            "ok": (
+                all(item.get("ok") for item in records)
+                and watcher.get("ok", False)
+                and not scale_in_blocked
+            ),
+            "scaled": bool(added_workers or removed_workers),
             "added_roles": [
                 item["role"]
                 for item in actual_by_role
@@ -976,6 +1332,17 @@ class SwarmRuntime:
             ],
             "added_workers": added_workers,
             "added_instances": actual_by_role,
+            "removed_workers": removed_workers,
+            "removed_instances": [
+                {
+                    "role": role,
+                    "count": max(0, current_counts[role] - final_counts[role]),
+                }
+                for role in DEFAULT_PRIORITY
+                if current_counts[role] > final_counts[role]
+            ],
+            "scale_in_blocked": scale_in_blocked,
+            "requested_target_instances": target_counts,
             "previous_worker_instances": current_counts,
             "worker_roles": self._bound_worker_roles(),
             "worker_instances": final_counts,
@@ -990,7 +1357,11 @@ class SwarmRuntime:
         tab = self._resolve(str(name))
         if not tab:
             return {"ok": False, "error": "bound conversation is not open"}
-        result = self.bridge.send(int(tab["id"]), text)
+        result = self._send_when_ready(
+            int(tab["id"]),
+            text,
+            timeout=10.0,
+        )
         result["name"] = str(name)
         return result
 
@@ -1017,14 +1388,28 @@ class SwarmRuntime:
                 item["error"] = "bound conversation is not currently open"
             agents.append(item)
 
+        coordination = self.coordination_plan()
+        kind_by_task = {
+            str(node.get("task_id") or ""): str(node.get("blocker_kind") or "")
+            for node in coordination.get("task_nodes", [])
+            if isinstance(node, dict)
+        }
+        tasks = []
+        for task in self.store.tasks():
+            item = dict(task)
+            task_id = str(item.get("task_id") or "")
+            if str(item.get("status") or "").lower() == "blocked":
+                item["blocker_kind"] = kind_by_task.get(task_id) or self._blocker_kind(item)
+            tasks.append(item)
+
         return {
             "ok": True,
             "bridge": self.bridge.health(),
             "agents": agents,
-            "tasks": self.store.tasks(),
+            "tasks": tasks,
             "shared_status": self.store.status(),
             "supersteps": self.store.supersteps(include_pending=False),
-            "coordination": self.coordination_plan(),
+            "coordination": coordination,
             "completion_truth": (
                 "Browser idle means only that the page is not generating. "
                 "Use durable task state and real external verification for completion."

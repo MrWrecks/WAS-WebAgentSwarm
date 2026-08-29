@@ -94,13 +94,30 @@ class BridgeClient:
         })
         return self._json("/inspect?" + query, timeout=7.0)
 
-    def send(self, tab_id: int, text: str) -> Dict[str, object]:
+    def close_tab(self, tab_id: int) -> Dict[str, object]:
+        return self._json(
+            "/close",
+            method="POST",
+            payload={"tabId": int(tab_id)},
+            timeout=9.0,
+        )
+
+    def send(
+        self,
+        tab_id: int,
+        text: str,
+        command_id: str = "",
+    ) -> Dict[str, object]:
         message = str(text or "").strip()
         if not message:
             return {"ok": False, "error": "text is required"}
+        payload = {"tabId": int(tab_id), "text": message}
+        clean_command_id = str(command_id or "").strip()
+        if clean_command_id:
+            payload["commandId"] = clean_command_id
         return self._json(
             "/send",
             method="POST",
-            payload={"tabId": int(tab_id), "text": message},
+            payload=payload,
             timeout=9.0,
         )

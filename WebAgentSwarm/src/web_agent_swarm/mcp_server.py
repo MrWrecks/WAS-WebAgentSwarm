@@ -54,7 +54,7 @@ def web_agent_swarm_start(
     instances: dict = None,
     spawn_url: str = "",
     start_watch: bool = True,
-    interval: float = 15.0,
+    interval: float = 300.0,
     max_silence: float = 300.0,
 ):
     """Start the confirmed swarm with optional per-role instance counts."""
@@ -109,10 +109,10 @@ def web_agent_swarm_scale(
     max_instances_per_role: int = 4,
     spawn_url: str = "",
     start_watch: bool = True,
-    interval: float = 15.0,
+    interval: float = 300.0,
     max_silence: float = 300.0,
 ):
-    """Add missing-role or same-role worker instances without removing existing workers."""
+    """Elastically add or safely suspend worker instances toward requested/durable targets."""
     return swarm.scale(
         requested_roles=requested_roles,
         requested_instances=requested_instances,

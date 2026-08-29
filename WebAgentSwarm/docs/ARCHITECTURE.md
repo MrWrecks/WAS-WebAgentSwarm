@@ -69,7 +69,7 @@ web_agent_swarm_start     browser mutation
 This keeps user agency while allowing natural-language trigger phrases rather than one
 hard-coded sentence.
 
-## Durable task graph, Send-style map/reduce, and elastic scale-out
+## Durable task graph, Send-style map/reduce, and elastic scale-out/scale-in
 
 The runtime derives a LangGraph-inspired coordination view from the durable task board without
 adding LangGraph as a runtime dependency:
@@ -102,7 +102,9 @@ web_agent_swarm_coordination_plan
 web_agent_swarm_elastic_plan
     |
     +--> no-op when instance capacity is sufficient
-    +--> web_agent_swarm_scale for missing roles or same-role instances
+    +--> add_instances when durable pressure exceeds active capacity
+    +--> remove_instances when durable pressure falls below active capacity
+    +--> web_agent_swarm_scale applies both directions with lease/superstep/UI guards
 ```
 
 The state schema stores per-task payload/group metadata, exact `claimed_by` worker identity,
@@ -113,19 +115,28 @@ prevents another worker from claiming the same shard. Retryable failures can ret
 
 Worker identity is separate from role identity. A role describes capability; worker names are
 stable execution instances such as `implementer`, `implementer-2`, and
-`implementer-3`. Initial planning may propose multiple instances of one role, and runtime
-scale-out can add more instances without removing existing workers.
+`implementer-3`. Initial planning may propose multiple instances of one role. Runtime
+scale-out may add instances, while scale-in marks safe workers `suspended`, closes their
+browser tabs, preserves conversation bindings, and preferentially resumes those conversations
+when capacity is needed again.
 
 Mutating durable state uses a cross-process lock plus atomic file replacement so concurrent
 browser agents cannot safely-by-accident overwrite each other's claims.
 
 Tasks may also declare dependency task IDs. A dependent task cannot enter the executable
-frontier until every dependency is `done`. Review tasks route to the reviewer role; blocked
-tasks route to the debugger role. Browser idleness is an availability signal only and never
-triggers scale-out by itself.
+frontier until every dependency is `done`. Review tasks route to the reviewer role. Blocked
+tasks are typed: dependency/external waits stay parked, human-input waits interrupt the main
+agent, and recoverable/verification/unknown failures may route to the debugger. Browser
+idleness is an availability signal only and never creates execution pressure by itself.
+
+The watcher polls every 300 seconds by default. Its digest contains durable task/status/
+superstep state plus actionable transport faults; ordinary UI idle/generating/message changes
+are excluded. The unresolved-work max-silence wake is also 300 seconds by default.
 
 This is intentionally a **state graph**, not a hidden autonomous agent manager. The main Web
-Agent still decides whether a recommendation warrants browser-side dispatch or scale-out.
+Agent still decides dispatch; the runtime may apply bounded elastic add/remove recommendations
+while refusing scale-in for a worker with a live task lease, open/ready superstep, or generating
+browser tab.
 
 ## Superstep barrier and pending writes
 

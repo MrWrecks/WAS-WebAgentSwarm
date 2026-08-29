@@ -55,12 +55,21 @@
     const lastUser = [...messages].reverse().find(item => item.role === 'user') || null;
     const lastAssistant = [...messages].reverse().find(item => item.role === 'assistant') || null;
     const busy = generating();
+    const visibleText = String(document.body?.innerText || '');
+    const connectionInterrupted = (
+      visibleText.includes('连接已中断') ||
+      visibleText.includes('正在等待完整回复') ||
+      visibleText.includes('Connection interrupted') ||
+      visibleText.includes('waiting for a complete response')
+    );
 
     return {
       title: document.title,
       url: location.href,
       uiState: busy ? 'generating' : 'idle',
       generating: busy,
+      connectionInterrupted,
+      stuckGenerating: Boolean(busy && connectionInterrupted),
       composerPresent: Boolean(composer()),
       sendButtonEnabled: Boolean(sendButton() && !sendButton().disabled),
       messageCount: messages.length,

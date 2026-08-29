@@ -22,6 +22,38 @@ class BridgeClientTest(unittest.TestCase):
             timeout=12.0,
         )
 
+    def test_send_carries_command_id_for_idempotent_retry(self):
+        client = BridgeClient("http://example.invalid")
+        with mock.patch.object(
+            client,
+            "_json",
+            return_value={"ok": True},
+        ) as bridge_call:
+            result = client.send(7, "continue", command_id="cmd-123")
+        self.assertTrue(result["ok"])
+        bridge_call.assert_called_once_with(
+            "/send",
+            method="POST",
+            payload={"tabId": 7, "text": "continue", "commandId": "cmd-123"},
+            timeout=9.0,
+        )
+
+    def test_close_tab_uses_bridge_close_endpoint(self):
+        client = BridgeClient("http://example.invalid")
+        with mock.patch.object(
+            client,
+            "_json",
+            return_value={"ok": True, "tabId": 7},
+        ) as bridge_call:
+            result = client.close_tab(7)
+        self.assertTrue(result["ok"])
+        bridge_call.assert_called_once_with(
+            "/close",
+            method="POST",
+            payload={"tabId": 7},
+            timeout=9.0,
+        )
+
     def test_open_tab_never_launches_another_profile(self):
         client = BridgeClient("http://example.invalid")
         with mock.patch.object(
