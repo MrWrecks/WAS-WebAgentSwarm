@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "web-agent-swarm": {
+      "command": "python",
+      "args": ["-m", "web_agent_swarm.mcp_server"],
+      "env": {
+        "WEB_SWARM_BRIDGE_URL": "http://127.0.0.1:8788"
+      }
+    },
+    "codexpro-lite": {
+      "command": "python",
+      "args": ["-m", "web_agent_swarm.codexpro_server"],
+      "env": {
+        "CODEXPRO_ROOT": "<path-to-your-workspace>"
+      }
+    }
+  }
+}
