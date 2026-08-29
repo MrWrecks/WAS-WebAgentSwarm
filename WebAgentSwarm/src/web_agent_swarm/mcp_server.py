@@ -50,7 +50,7 @@ def web_agent_swarm_plan(worker_count: int = 0, requested_roles: list = None):
 
 @mcp.tool
 def web_agent_swarm_start(
-    roles: list,
+    roles: list = None,
     instances: dict = None,
     spawn_url: str = "",
     start_watch: bool = True,
@@ -77,26 +77,30 @@ def web_agent_swarm_snapshot(tail: int = 4):
 @mcp.tool
 def web_agent_swarm_coordination_plan(
     active_roles: list = None,
-    max_new_roles: int = 2,
+    max_new_roles: int = 6,
     max_instances_per_role: int = 4,
+    max_total_workers: int = 6,
 ):
-    """Return task routing, shard frontier, leases, reducers and instance pressure."""
+    """Return task routing, shard frontier, leases, reducers and budgeted instance pressure."""
     return swarm.coordination_plan(
         active_roles=active_roles,
         max_new_roles=max_new_roles,
         max_instances_per_role=max_instances_per_role,
+        max_total_workers=max_total_workers,
     )
 
 
 @mcp.tool
 def web_agent_swarm_elastic_plan(
-    max_new_roles: int = 2,
+    max_new_roles: int = 6,
     max_instances_per_role: int = 4,
+    max_total_workers: int = 6,
 ):
-    """Recommend missing-role and same-role instances from durable shard pressure."""
+    """Recommend budgeted elastic worker topology from durable shard pressure."""
     return swarm.elastic_plan(
         max_new_roles=max_new_roles,
         max_instances_per_role=max_instances_per_role,
+        max_total_workers=max_total_workers,
     )
 
 
@@ -105,8 +109,10 @@ def web_agent_swarm_scale(
     requested_roles: list = None,
     requested_instances: dict = None,
     worker_count: int = 0,
-    max_new_roles: int = 2,
+    max_new_roles: int = 6,
     max_instances_per_role: int = 4,
+    max_total_workers: int = 6,
+    scale_in_grace_seconds: float = 300.0,
     spawn_url: str = "",
     start_watch: bool = True,
     interval: float = 300.0,
@@ -119,6 +125,8 @@ def web_agent_swarm_scale(
         worker_count=worker_count,
         max_new_roles=max_new_roles,
         max_instances_per_role=max_instances_per_role,
+        max_total_workers=max_total_workers,
+        scale_in_grace_seconds=scale_in_grace_seconds,
         spawn_url=spawn_url,
         start_watch=start_watch,
         interval=interval,
@@ -130,6 +138,206 @@ def web_agent_swarm_scale(
 def web_agent_swarm_send(name: str, text: str):
     """Send to one stable named swarm conversation."""
     return swarm.send(name, text)
+
+
+
+
+@mcp.tool
+def swarm_graph_create(
+    name: str,
+    description: str = "",
+    graph_id: str = "",
+    metadata: dict = None,
+):
+    """Create one durable draft SwarmGraph. Populate it, validate it, then activate it."""
+    return store.graph_create(
+        name,
+        description=description,
+        graph_id=graph_id,
+        metadata=metadata,
+    )
+
+
+@mcp.tool
+def swarm_graph_get(graph_id: str = ""):
+    """Read one full SwarmGraph; omit graph_id to read the active graph."""
+    return store.graph_get(graph_id)
+
+
+@mcp.tool
+def swarm_graph_list():
+    """List durable SwarmGraphs with revision, counts and active marker."""
+    return store.graphs()
+
+
+@mcp.tool
+def swarm_graph_activate(graph_id: str, expected_revision: int = -1):
+    """Validate and activate a SwarmGraph as an execution gate for task dispatch."""
+    return store.graph_activate(graph_id, expected_revision=expected_revision)
+
+
+@mcp.tool
+def swarm_graph_deactivate(graph_id: str = ""):
+    """Deactivate the current SwarmGraph and fall back to the legacy durable task DAG."""
+    return store.graph_deactivate(graph_id)
+
+
+@mcp.tool
+def swarm_graph_update(graph_id: str, patch: dict, expected_revision: int = -1):
+    """Update graph name/description/metadata using optional optimistic revision control."""
+    return store.graph_update(
+        graph_id,
+        patch,
+        expected_revision=expected_revision,
+    )
+
+
+@mcp.tool
+def swarm_graph_replace(
+    graph_id: str,
+    nodes: list,
+    edges: list,
+    expected_revision: int = -1,
+):
+    """Atomically replace a graph topology after full normalization/validation."""
+    return store.graph_replace(
+        graph_id,
+        nodes,
+        edges,
+        expected_revision=expected_revision,
+    )
+
+
+@mcp.tool
+def swarm_graph_preview(graph_id: str = ""):
+    """Compile a draft/active graph into effective edge states and task gates without mutation."""
+    return store.graph_preview(graph_id)
+
+
+@mcp.tool
+def swarm_graph_delete(graph_id: str, expected_revision: int = -1):
+    """Delete one SwarmGraph; deleting the active graph also deactivates graph routing."""
+    return store.graph_delete(graph_id, expected_revision=expected_revision)
+
+
+@mcp.tool
+def swarm_graph_node_add(
+    graph_id: str,
+    node_id: str,
+    kind: str = "task",
+    task_id: str = "",
+    role: str = "",
+    label: str = "",
+    status: str = "ready",
+    state: object = None,
+    metadata: dict = None,
+    expected_revision: int = -1,
+):
+    """Add a graph node. Task nodes bind durable task_id; control/router/join nodes may use durable state."""
+    return store.graph_node_add(
+        graph_id,
+        node_id,
+        kind=kind,
+        task_id=task_id,
+        role=role,
+        label=label,
+        status=status,
+        state=state,
+        metadata=metadata,
+        expected_revision=expected_revision,
+    )
+
+
+@mcp.tool
+def swarm_graph_node_update(
+    graph_id: str,
+    node_id: str,
+    patch: dict,
+    expected_revision: int = -1,
+):
+    """Patch graph node kind/task/role/label/status/state/metadata with revision protection."""
+    return store.graph_node_update(
+        graph_id,
+        node_id,
+        patch,
+        expected_revision=expected_revision,
+    )
+
+
+@mcp.tool
+def swarm_graph_node_remove(
+    graph_id: str,
+    node_id: str,
+    expected_revision: int = -1,
+):
+    """Remove a graph node and all incident edges."""
+    return store.graph_node_remove(
+        graph_id,
+        node_id,
+        expected_revision=expected_revision,
+    )
+
+
+@mcp.tool
+def swarm_graph_edge_add(
+    graph_id: str,
+    source: str,
+    target: str,
+    kind: str = "dependency",
+    condition: dict = None,
+    edge_id: str = "",
+    label: str = "",
+    metadata: dict = None,
+    expected_revision: int = -1,
+):
+    """Add dependency/conditional edge. Conditions are structured data, never executable code."""
+    return store.graph_edge_add(
+        graph_id,
+        source,
+        target,
+        kind=kind,
+        condition=condition,
+        edge_id=edge_id,
+        label=label,
+        metadata=metadata,
+        expected_revision=expected_revision,
+    )
+
+
+@mcp.tool
+def swarm_graph_edge_update(
+    graph_id: str,
+    edge_id: str,
+    patch: dict,
+    expected_revision: int = -1,
+):
+    """Patch source/target/kind/condition/label/metadata on one edge."""
+    return store.graph_edge_update(
+        graph_id,
+        edge_id,
+        patch,
+        expected_revision=expected_revision,
+    )
+
+
+@mcp.tool
+def swarm_graph_edge_remove(
+    graph_id: str,
+    edge_id: str,
+    expected_revision: int = -1,
+):
+    """Remove one explicit SwarmGraph edge."""
+    return store.graph_edge_remove(
+        graph_id,
+        edge_id,
+        expected_revision=expected_revision,
+    )
+
+
+@mcp.tool
+def swarm_graph_validate(graph_id: str = ""):
+    """Validate topology/task bindings and report entry/terminal nodes; omit id for active graph."""
+    return store.graph_validate(graph_id)
 
 
 @mcp.tool
@@ -272,6 +480,56 @@ def swarm_superstep_get(step_id: str, include_pending: bool = True):
 def swarm_superstep_list(include_pending: bool = False):
     """List durable superstep barriers."""
     return store.supersteps(include_pending=include_pending)
+
+
+@mcp.tool
+def swarm_interrupt_create(
+    prompt: str,
+    task_id: str = "",
+    payload: object = None,
+    interrupt_id: str = "",
+):
+    """Persist a human-input interrupt and pause its task without relying on chat memory."""
+    return store.interrupt_create(
+        prompt,
+        task_id=task_id,
+        payload=payload,
+        interrupt_id=interrupt_id,
+    )
+
+
+@mcp.tool
+def swarm_interrupt_resume(interrupt_id: str, value: object = None):
+    """Resume one durable human-input interrupt and make its task runnable again."""
+    return store.interrupt_resume(interrupt_id, value=value)
+
+
+@mcp.tool
+def swarm_interrupt_list(status: str = ""):
+    """List durable interrupts, optionally filtered to open/resumed."""
+    return store.interrupts(status=status)
+
+
+@mcp.tool
+def swarm_checkpoint_create(
+    label: str = "",
+    metadata: dict = None,
+    retain: int = 20,
+):
+    """Create a bounded coordination checkpoint for fault recovery/time-travel."""
+    return store.checkpoint_create(label=label, metadata=metadata, retain=retain)
+
+
+@mcp.tool
+def swarm_checkpoint_list():
+    """List coordination checkpoints without returning their full state snapshots."""
+    return store.checkpoints()
+
+
+@mcp.tool
+def swarm_checkpoint_restore(checkpoint_id: str):
+    """Safely restore coordination state when no live lease or open superstep exists."""
+    return store.checkpoint_restore(checkpoint_id)
 
 
 @mcp.tool

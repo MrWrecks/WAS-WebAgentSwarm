@@ -31,9 +31,10 @@ shared task/status state, and combined snapshots.
 
 ### Watcher
 
-The watcher is deterministic. It does not decide what task should be done. It hashes
-worker UI state plus durable shared state and wakes the main agent when something changes
-or a fallback silence interval expires.
+The watcher is deterministic. It does not decide what task should be done. Its semantic digest
+contains durable task/status/superstep/interrupt state plus actionable transport faults; ordinary
+UI idle/generating/message churn is excluded. It wakes the main agent on semantic change or,
+while unresolved work/capacity maintenance remains, after the bounded silence interval.
 
 ### Bundled MCP servers
 
@@ -44,41 +45,57 @@ The Python package exposes two MCP servers with FastMCP:
 
 The CodexPro Lite server is workspace-bounded and deliberately excludes private connector configuration and machine-specific roots.
 
-## Two-stage startup
+## Confirmed startup with main-only elastic bootstrap
 
 ```text
 user asks for a swarm
        |
        v
-web_agent_swarm_plan      read-only
+web_agent_swarm_plan      read-only proposal
        |
        v
-proposal: count + roles
-       |
-       v
-user confirms/revises
+user confirms
        |
        v
 web_agent_swarm_start     browser mutation
        |
-       +-- main agent
-       +-- selected workers only
-       +-- stable bindings
+       +-- main agent only by default
+       +-- stable binding
+       |
+       v
+main reads durable graph
+       |
+       v
+elastic_plan -> scale
+       |
+       +-- create/reuse only justified workers
 ```
 
-This keeps user agency while allowing natural-language trigger phrases rather than one
-hard-coded sentence.
+This keeps the proposal/confirmation boundary while separating **approval to start the swarm**
+from a fixed initial worker topology. With no explicit roles, only the main conversation is opened;
+the main agent then derives the initial worker count/roles from runnable parallel pressure.
+Explicit roles/instance counts remain available when an operator wants to pin bootstrap capacity.
 
-## Durable task graph, Send-style map/reduce, and elastic scale-out/scale-in
+## Explicit durable SwarmGraph, task DAG, and elastic execution
 
-The runtime derives a LangGraph-inspired coordination view from the durable task board without
-adding LangGraph as a runtime dependency:
+WAS now separates the logical execution topology from browser execution capacity. An optional
+activated `SwarmGraph` is persisted beside the legacy task DAG and is compiled into dispatch gates
+without adding LangGraph as a runtime dependency:
 
 ```text
-durable tasks
+durable SwarmGraph (optional, explicit, revisioned)
     |
-    +--> conditional route
-    |      dispatch / wait_dependencies / wait_retry / leased / interrupt / terminal
+    +--> task/control/router/join/agent/tool nodes
+    +--> dependency edges
+    +--> conditional edges (structured predicates, no code execution)
+    |
+    v
+compiled task gates
+    |
+    +--> dispatch / wait_graph / graph_unselected
+    |
+    +--> durable task DAG
+    |      wait_dependencies / wait_retry / leased / interrupt / terminal
     |
     +--> swarm_task_fanout(items, owner)       # Send-style map
     |      +--> shard 0 payload
@@ -107,7 +124,19 @@ web_agent_swarm_elastic_plan
     +--> web_agent_swarm_scale applies both directions with lease/superstep/UI guards
 ```
 
-The state schema stores per-task payload/group metadata, exact `claimed_by` worker identity,
+The state schema stores graphs in `graphs` plus one `active_graph_id`. Each graph owns
+`nodes`, `edges`, metadata, timestamps, and a monotonic `revision`. Graph mutation methods
+accept `expected_revision`; mismatches fail closed, providing optimistic concurrency control for
+multiple browser agents editing the same topology.
+
+Task graph nodes bind a durable `task_id` and may override its worker role. Router/control/join
+nodes may instead carry explicit durable `status` and JSON `state`. For task-bound nodes, live
+task status/result is authoritative at compile time. Dependency edges require the source to be
+`done` or `skipped`. Conditional edges wait for a terminal source, then evaluate a bounded
+predicate over source status/state, task result, or shared status. No edge condition contains
+executable Python/JavaScript.
+
+The state schema also stores per-task payload/group metadata, exact `claimed_by` worker identity,
 lease expiry, attempt count, retry deadline, bounded `max_attempts`, and result. A valid lease
 prevents another worker from claiming the same shard. Retryable failures can return to
 `ready`; an expired lease becomes recoverable dispatch work. Fan-out groups retain a
@@ -115,13 +144,26 @@ prevents another worker from claiming the same shard. Retryable failures can ret
 
 Worker identity is separate from role identity. A role describes capability; worker names are
 stable execution instances such as `implementer`, `implementer-2`, and
-`implementer-3`. Initial planning may propose multiple instances of one role. Runtime
-scale-out may add instances, while scale-in marks safe workers `suspended`, closes their
-browser tabs, preserves conversation bindings, and preferentially resumes those conversations
-when capacity is needed again.
+`implementer-3`. Runtime scale-out may add instances, while scale-in marks safe workers
+`suspended`, closes their browser tabs, preserves conversation bindings, and preferentially
+resumes those conversations when capacity is needed again.
+
+The allocator has two anti-thrashing constraints. First, a global worker budget (default six)
+limits desired runnable capacity across roles; live leased work forms a protected minimum and is
+never force-removed just to satisfy the configured budget. Second, automatic scale-in records an
+`excess_since` timestamp and waits through a default 300-second grace window before closing a
+safe surplus worker. Explicit operator target counts bypass that grace. A worker with a live task
+lease, open/ready superstep participation, or a generating browser tab still cannot be suspended.
 
 Mutating durable state uses a cross-process lock plus atomic file replacement so concurrent
-browser agents cannot safely-by-accident overwrite each other's claims.
+browser agents cannot safely-by-accident overwrite each other's claims. Graph edits add a second
+guard: revision checks prevent a stale topology writer from overwriting a newer graph revision.
+
+An active SwarmGraph gates both `coordination_plan` and `swarm_task_claim`. Therefore graph
+routing is not advisory: a worker cannot bypass the main orchestrator and claim a task whose graph
+node is still `wait_graph` or whose conditional branch is `graph_unselected`. A task with an
+already-valid lease is not preempted by a later graph edit; topology changes affect new claims and
+future scheduling.
 
 Tasks may also declare dependency task IDs. A dependent task cannot enter the executable
 frontier until every dependency is `done`. Review tasks route to the reviewer role. Blocked
@@ -130,13 +172,58 @@ agent, and recoverable/verification/unknown failures may route to the debugger. 
 idleness is an availability signal only and never creates execution pressure by itself.
 
 The watcher polls every 300 seconds by default. Its digest contains durable task/status/
-superstep state plus actionable transport faults; ordinary UI idle/generating/message changes
-are excluded. The unresolved-work max-silence wake is also 300 seconds by default.
+superstep/interrupt state, the active SwarmGraph topology/revision, and actionable transport
+faults; ordinary UI idle/generating/message changes are excluded. A rejected conditional branch
+(`graph_unselected`) is not treated as unresolved work, so it does not create useless safety ticks.
+The unresolved-work max-silence wake is also 300 seconds by default.
 
 This is intentionally a **state graph**, not a hidden autonomous agent manager. The main Web
 Agent still decides dispatch; the runtime may apply bounded elastic add/remove recommendations
 while refusing scale-in for a worker with a live task lease, open/ready superstep, or generating
 browser tab.
+
+## Durable interrupt/resume and checkpoint recovery
+
+WAS adopts LangGraph-style persistence semantics at the coordination layer without embedding a
+LangGraph runtime. Human input is represented as explicit durable state rather than an implicit
+conversation pause:
+
+```text
+task / main
+    |
+    v
+swarm_interrupt_create
+    |
+    +-- durable interrupt = open
+    +-- linked task = blocked(human_input)
+    +-- worker lease released
+    |
+    v
+external/user input arrives
+    |
+    v
+swarm_interrupt_resume(value)
+    |
+    +-- resume value persisted
+    +-- interrupt = resumed
+    +-- linked task = ready
+```
+
+For risky graph rewrites or recovery points, `swarm_checkpoint_create` stores a bounded snapshot
+of tasks, shared status, supersteps, interrupts, every SwarmGraph, and `active_graph_id`. Browser
+bindings are deliberately excluded:
+a browser conversation is an execution resource/identity binding, not graph state. Restore keeps
+those bindings and checkpoint history intact and fails closed while any current live task lease or
+open/ready superstep exists. Any task restored in an `active` state has its lease expiry cleared,
+so recovery routes it through expired-lease dispatch rather than pretending an old worker still
+owns it. If the checkpoint itself captured an open/ready superstep, restore marks that historical
+barrier `aborted` and clears affected task-to-superstep bindings so an old barrier cannot be
+resurrected into a recovery deadlock.
+
+Task `group_id`, `parent_task_id`, fan-out shards, and reducer boundaries provide lightweight
+subgraph/workflow scoping. This is intentionally smaller than a general nested graph engine:
+independent work scopes share the durable store but keep explicit task/group identities and do not
+gain hidden memory merely because they share a browser session.
 
 ## Superstep barrier and pending writes
 

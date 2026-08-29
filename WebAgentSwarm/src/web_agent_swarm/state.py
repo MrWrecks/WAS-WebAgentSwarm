@@ -9,6 +9,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from .graph import compile_graph, graph_validate, normalize_edge, normalize_node
+
 
 def default_state_dir() -> Path:
     configured = os.environ.get("WEB_SWARM_STATE_DIR")
@@ -60,11 +62,15 @@ class DurableStore:
 
     def _empty(self) -> Dict[str, object]:
         return {
-            "schema_version": 4,
+            "schema_version": 7,
             "bindings": {},
             "tasks": {},
             "shared_status": {},
             "supersteps": {},
+            "interrupts": {},
+            "checkpoints": {},
+            "graphs": {},
+            "active_graph_id": "",
         }
 
     def load(self) -> Dict[str, object]:
@@ -100,6 +106,22 @@ class DurableStore:
                 task.setdefault("max_attempts", 3)
                 task.setdefault("last_error", "")
                 task.setdefault("retry_after", 0.0)
+                task.setdefault("interrupt_id", "")
+        for graph_id, graph in list(base["graphs"].items()):
+            if not isinstance(graph, dict):
+                base["graphs"].pop(graph_id, None)
+                continue
+            graph.setdefault("graph_id", str(graph_id))
+            graph.setdefault("name", str(graph_id))
+            graph.setdefault("description", "")
+            graph.setdefault("metadata", {})
+            graph.setdefault("nodes", {})
+            graph.setdefault("edges", {})
+            graph.setdefault("revision", 1)
+            graph.setdefault("created_at", 0.0)
+            graph.setdefault("updated_at", 0.0)
+        if base["active_graph_id"] and base["active_graph_id"] not in base["graphs"]:
+            base["active_graph_id"] = ""
         return base
 
     def save(self, data: Dict[str, object]) -> None:
@@ -183,6 +205,7 @@ class DurableStore:
                 "max_attempts": attempts_limit,
                 "last_error": "",
                 "retry_after": 0.0,
+                "interrupt_id": "",
                 "updated_at": time.time(),
             }
             data["tasks"][active_id] = task
@@ -230,6 +253,58 @@ class DurableStore:
                 raise RuntimeError("task is not claimable in status {0}".format(status))
             current_worker = str(task.get("claimed_by") or "")
             lease_expires = float(task.get("lease_expires_at") or 0.0)
+            existing_valid_owner = (
+                status == "active"
+                and current_worker == clean_worker
+                and lease_expires > now
+            )
+            if not existing_valid_owner:
+                active_graph_id = str(data.get("active_graph_id") or "")
+                active_graph = data["graphs"].get(active_graph_id) if active_graph_id else None
+                if isinstance(active_graph, dict):
+                    compiled = compile_graph(
+                        active_graph,
+                        {
+                            str(item_id): item
+                            for item_id, item in data["tasks"].items()
+                            if isinstance(item, dict)
+                        },
+                        data["shared_status"],
+                    )
+                    if not compiled.get("valid", False):
+                        raise RuntimeError("active SwarmGraph is invalid")
+                    gate = (compiled.get("task_gates") or {}).get(str(task_id))
+                    if isinstance(gate, dict):
+                        if gate.get("unselected"):
+                            raise RuntimeError("task is on an unselected SwarmGraph branch")
+                        if not gate.get("ready", False):
+                            raise RuntimeError(
+                                "task is blocked by SwarmGraph gate: {0}".format(
+                                    ",".join(gate.get("unsatisfied_edge_ids") or gate.get("pending_conditional_edge_ids") or [])
+                                    or "pending"
+                                )
+                            )
+                        node_id = str((compiled.get("task_node_map") or {}).get(str(task_id)) or "")
+                        graph_node = next(
+                            (
+                                item
+                                for item in compiled.get("nodes", [])
+                                if isinstance(item, dict)
+                                and str(item.get("node_id") or "") == node_id
+                            ),
+                            {},
+                        )
+                        expected_role = str(graph_node.get("role") or "").strip().lower()
+                        if (
+                            expected_role
+                            and clean_worker != expected_role
+                            and not clean_worker.startswith(expected_role + "-")
+                        ):
+                            raise RuntimeError(
+                                "task SwarmGraph role requires worker role {0}".format(
+                                    expected_role
+                                )
+                            )
             if current_worker and current_worker != clean_worker and lease_expires > now:
                 raise RuntimeError("task is already leased by {0}".format(current_worker))
             attempts = int(task.get("attempts") or 0)
@@ -764,3 +839,935 @@ class DurableStore:
 
     def status(self) -> Dict[str, object]:
         return dict(self.load()["shared_status"])
+
+    @staticmethod
+    def _graph_revision_guard(graph: Dict[str, object], expected_revision: int) -> None:
+        expected = int(expected_revision)
+        if expected >= 0 and int(graph.get("revision") or 0) != expected:
+            raise RuntimeError(
+                "graph revision conflict: expected {0}, current {1}".format(
+                    expected,
+                    int(graph.get("revision") or 0),
+                )
+            )
+
+    @staticmethod
+    def _graph_summary(graph: Dict[str, object], active: bool = False) -> Dict[str, object]:
+        return {
+            "graph_id": str(graph.get("graph_id") or ""),
+            "name": str(graph.get("name") or ""),
+            "description": str(graph.get("description") or ""),
+            "revision": int(graph.get("revision") or 0),
+            "node_count": len(graph.get("nodes") or {}),
+            "edge_count": len(graph.get("edges") or {}),
+            "active": bool(active),
+            "created_at": float(graph.get("created_at") or 0.0),
+            "updated_at": float(graph.get("updated_at") or 0.0),
+            "metadata": copy.deepcopy(graph.get("metadata") or {}),
+        }
+
+    def graph_create(
+        self,
+        name: str,
+        description: str = "",
+        graph_id: str = "",
+        metadata: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, object]:
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            raise ValueError("graph name is required")
+        if metadata is not None and not isinstance(metadata, dict):
+            raise ValueError("graph metadata must be an object")
+        json.dumps(metadata or {}, ensure_ascii=False)
+        clean_id = str(graph_id or "").strip() or "graph_" + uuid.uuid4().hex[:10]
+        if any(ch.isspace() for ch in clean_id):
+            raise ValueError("graph_id cannot contain whitespace")
+        with self._write_lock():
+            data = self.load()
+            if clean_id in data["graphs"]:
+                raise ValueError("graph_id already exists")
+            now = time.time()
+            graph = {
+                "graph_id": clean_id,
+                "name": clean_name,
+                "description": str(description or "").strip(),
+                "metadata": copy.deepcopy(metadata or {}),
+                "nodes": {},
+                "edges": {},
+                "revision": 1,
+                "created_at": now,
+                "updated_at": now,
+            }
+            data["graphs"][clean_id] = graph
+            self.save(data)
+            result = copy.deepcopy(graph)
+            result["active"] = False
+            return result
+
+    def graph_get(self, graph_id: str = "") -> Dict[str, object]:
+        data = self.load()
+        clean_id = str(graph_id or "").strip() or str(data.get("active_graph_id") or "")
+        if not clean_id:
+            return {}
+        graph = data["graphs"].get(clean_id)
+        if not isinstance(graph, dict):
+            raise KeyError("unknown graph_id")
+        result = copy.deepcopy(graph)
+        result["active"] = clean_id == str(data.get("active_graph_id") or "")
+        return result
+
+    def graphs(self) -> List[Dict[str, object]]:
+        data = self.load()
+        active_id = str(data.get("active_graph_id") or "")
+        values = [
+            self._graph_summary(graph, active=str(graph_id) == active_id)
+            for graph_id, graph in data["graphs"].items()
+            if isinstance(graph, dict)
+        ]
+        return sorted(
+            values,
+            key=lambda item: (
+                not bool(item["active"]),
+                float(item["created_at"]),
+                str(item["graph_id"]),
+            ),
+        )
+
+    def graph_activate(
+        self,
+        graph_id: str,
+        expected_revision: int = -1,
+    ) -> Dict[str, object]:
+        clean_id = str(graph_id or "").strip()
+        if not clean_id:
+            raise ValueError("graph_id is required")
+        with self._write_lock():
+            data = self.load()
+            graph = data["graphs"].get(clean_id)
+            if not isinstance(graph, dict):
+                raise KeyError("unknown graph_id")
+            self._graph_revision_guard(graph, expected_revision)
+            task_map = {
+                str(task_id): task
+                for task_id, task in data["tasks"].items()
+                if isinstance(task, dict)
+            }
+            validation = graph_validate(graph, tasks=task_map)
+            if not validation.get("ok"):
+                raise RuntimeError(
+                    "cannot activate invalid graph: {0}".format(
+                        "; ".join(validation.get("errors") or [])
+                    )
+                )
+            if not graph.get("nodes"):
+                raise RuntimeError("cannot activate an empty graph")
+            data["active_graph_id"] = clean_id
+            self.save(data)
+            result = self._graph_summary(graph, active=True)
+            result["validation"] = validation
+            return result
+
+    def graph_deactivate(self, graph_id: str = "") -> Dict[str, object]:
+        with self._write_lock():
+            data = self.load()
+            active_id = str(data.get("active_graph_id") or "")
+            requested = str(graph_id or "").strip()
+            if requested and requested != active_id:
+                return {
+                    "graph_id": requested,
+                    "active": False,
+                    "changed": False,
+                }
+            data["active_graph_id"] = ""
+            self.save(data)
+            return {
+                "graph_id": active_id,
+                "active": False,
+                "changed": bool(active_id),
+            }
+
+    def graph_update(
+        self,
+        graph_id: str,
+        patch: Dict[str, object],
+        expected_revision: int = -1,
+    ) -> Dict[str, object]:
+        if not isinstance(patch, dict) or not patch:
+            raise ValueError("graph patch must be a non-empty object")
+        allowed = {"name", "description", "metadata"}
+        unknown = sorted(set(patch) - allowed)
+        if unknown:
+            raise ValueError("unsupported graph patch field(s): {0}".format(", ".join(unknown)))
+        with self._write_lock():
+            data = self.load()
+            graph = data["graphs"].get(str(graph_id))
+            if not isinstance(graph, dict):
+                raise KeyError("unknown graph_id")
+            self._graph_revision_guard(graph, expected_revision)
+            if "name" in patch:
+                name = str(patch.get("name") or "").strip()
+                if not name:
+                    raise ValueError("graph name cannot be empty")
+                graph["name"] = name
+            if "description" in patch:
+                graph["description"] = str(patch.get("description") or "").strip()
+            if "metadata" in patch:
+                metadata = patch.get("metadata")
+                if not isinstance(metadata, dict):
+                    raise ValueError("graph metadata must be an object")
+                json.dumps(metadata, ensure_ascii=False)
+                graph["metadata"] = copy.deepcopy(metadata)
+            graph["revision"] = int(graph.get("revision") or 0) + 1
+            graph["updated_at"] = time.time()
+            self.save(data)
+            result = copy.deepcopy(graph)
+            result["active"] = str(graph_id) == str(data.get("active_graph_id") or "")
+            return result
+
+    def graph_replace(
+        self,
+        graph_id: str,
+        nodes: List[Dict[str, object]],
+        edges: List[Dict[str, object]],
+        expected_revision: int = -1,
+    ) -> Dict[str, object]:
+        if not isinstance(nodes, list) or not isinstance(edges, list):
+            raise ValueError("nodes and edges must be lists")
+        with self._write_lock():
+            data = self.load()
+            graph = data["graphs"].get(str(graph_id))
+            if not isinstance(graph, dict):
+                raise KeyError("unknown graph_id")
+            self._graph_revision_guard(graph, expected_revision)
+
+            normalized_nodes = {}
+            for spec in nodes:
+                if not isinstance(spec, dict):
+                    raise ValueError("every graph node must be an object")
+                node = normalize_node(
+                    node_id=str(spec.get("node_id") or ""),
+                    kind=str(spec.get("kind") or "task"),
+                    task_id=str(spec.get("task_id") or ""),
+                    role=str(spec.get("role") or ""),
+                    label=str(spec.get("label") or ""),
+                    status=str(spec.get("status") or "ready"),
+                    state=spec.get("state"),
+                    metadata=spec.get("metadata") or {},
+                )
+                node_id = str(node["node_id"])
+                if node_id in normalized_nodes:
+                    raise ValueError("duplicate node_id: {0}".format(node_id))
+                task_id = str(node.get("task_id") or "")
+                if task_id and task_id not in data["tasks"]:
+                    raise KeyError("unknown task_id: {0}".format(task_id))
+                normalized_nodes[node_id] = node
+
+            normalized_edges = {}
+            for spec in edges:
+                if not isinstance(spec, dict):
+                    raise ValueError("every graph edge must be an object")
+                edge_id = str(spec.get("edge_id") or "").strip()
+                if not edge_id:
+                    raise ValueError("bulk graph edge requires edge_id")
+                edge = normalize_edge(
+                    edge_id=edge_id,
+                    source=str(spec.get("source") or ""),
+                    target=str(spec.get("target") or ""),
+                    kind=str(spec.get("kind") or "dependency"),
+                    condition=spec.get("condition"),
+                    label=str(spec.get("label") or ""),
+                    metadata=spec.get("metadata") or {},
+                )
+                if edge_id in normalized_edges:
+                    raise ValueError("duplicate edge_id: {0}".format(edge_id))
+                normalized_edges[edge_id] = edge
+
+            candidate = copy.deepcopy(graph)
+            candidate["nodes"] = normalized_nodes
+            candidate["edges"] = normalized_edges
+            validation = graph_validate(
+                candidate,
+                tasks={
+                    str(task_id): task
+                    for task_id, task in data["tasks"].items()
+                    if isinstance(task, dict)
+                },
+            )
+            if not validation.get("ok"):
+                raise RuntimeError(
+                    "replacement topology is invalid: {0}".format(
+                        "; ".join(validation.get("errors") or [])
+                    )
+                )
+            if (
+                str(data.get("active_graph_id") or "") == str(graph_id)
+                and not normalized_nodes
+            ):
+                raise RuntimeError("cannot replace the active SwarmGraph with an empty topology")
+
+            graph["nodes"] = normalized_nodes
+            graph["edges"] = normalized_edges
+            graph["revision"] = int(graph.get("revision") or 0) + 1
+            graph["updated_at"] = time.time()
+            self.save(data)
+            return {
+                "graph_id": str(graph_id),
+                "revision": int(graph["revision"]),
+                "node_count": len(normalized_nodes),
+                "edge_count": len(normalized_edges),
+                "validation": validation,
+            }
+
+    def graph_preview(self, graph_id: str = "") -> Dict[str, object]:
+        data = self.load()
+        clean_id = str(graph_id or "").strip() or str(data.get("active_graph_id") or "")
+        if not clean_id:
+            return {
+                "active": False,
+                "preview": True,
+                "graph_id": "",
+                "revision": 0,
+                "nodes": [],
+                "edges": [],
+                "task_gates": {},
+                "task_node_map": {},
+            }
+        graph = data["graphs"].get(clean_id)
+        if not isinstance(graph, dict):
+            raise KeyError("unknown graph_id")
+        compiled = compile_graph(
+            graph,
+            {
+                str(task_id): task
+                for task_id, task in data["tasks"].items()
+                if isinstance(task, dict)
+            },
+            data["shared_status"],
+        )
+        compiled["active"] = clean_id == str(data.get("active_graph_id") or "")
+        compiled["preview"] = True
+        return compiled
+
+    def graph_delete(
+        self,
+        graph_id: str,
+        expected_revision: int = -1,
+    ) -> Dict[str, object]:
+        clean_id = str(graph_id or "").strip()
+        if not clean_id:
+            raise ValueError("graph_id is required")
+        with self._write_lock():
+            data = self.load()
+            graph = data["graphs"].get(clean_id)
+            if not isinstance(graph, dict):
+                raise KeyError("unknown graph_id")
+            self._graph_revision_guard(graph, expected_revision)
+            was_active = str(data.get("active_graph_id") or "") == clean_id
+            data["graphs"].pop(clean_id, None)
+            if was_active:
+                data["active_graph_id"] = ""
+            self.save(data)
+            return {
+                "graph_id": clean_id,
+                "deleted": True,
+                "was_active": was_active,
+            }
+
+    def graph_node_add(
+        self,
+        graph_id: str,
+        node_id: str,
+        kind: str = "task",
+        task_id: str = "",
+        role: str = "",
+        label: str = "",
+        status: str = "ready",
+        state: object = None,
+        metadata: Optional[Dict[str, object]] = None,
+        expected_revision: int = -1,
+    ) -> Dict[str, object]:
+        with self._write_lock():
+            data = self.load()
+            graph = data["graphs"].get(str(graph_id))
+            if not isinstance(graph, dict):
+                raise KeyError("unknown graph_id")
+            self._graph_revision_guard(graph, expected_revision)
+            node = normalize_node(
+                node_id=node_id,
+                kind=kind,
+                task_id=task_id,
+                role=role,
+                label=label,
+                status=status,
+                state=state,
+                metadata=metadata,
+            )
+            clean_node_id = str(node["node_id"])
+            if clean_node_id in graph["nodes"]:
+                raise ValueError("node_id already exists")
+            clean_task = str(node.get("task_id") or "")
+            if clean_task and clean_task not in data["tasks"]:
+                raise KeyError("unknown task_id")
+            candidate = copy.deepcopy(graph)
+            candidate["nodes"][clean_node_id] = node
+            validation = graph_validate(
+                candidate,
+                tasks={
+                    str(task_id): task
+                    for task_id, task in data["tasks"].items()
+                    if isinstance(task, dict)
+                },
+            )
+            if not validation.get("ok"):
+                raise RuntimeError(
+                    "graph node would make graph invalid: {0}".format(
+                        "; ".join(validation.get("errors") or [])
+                    )
+                )
+            graph["nodes"][clean_node_id] = node
+            graph["revision"] = int(graph.get("revision") or 0) + 1
+            graph["updated_at"] = time.time()
+            self.save(data)
+            return {
+                "graph_id": str(graph_id),
+                "revision": int(graph["revision"]),
+                "node": copy.deepcopy(node),
+                "validation": validation,
+            }
+
+    def graph_node_update(
+        self,
+        graph_id: str,
+        node_id: str,
+        patch: Dict[str, object],
+        expected_revision: int = -1,
+    ) -> Dict[str, object]:
+        if not isinstance(patch, dict) or not patch:
+            raise ValueError("node patch must be a non-empty object")
+        allowed = {"kind", "task_id", "role", "label", "status", "state", "metadata"}
+        unknown = sorted(set(patch) - allowed)
+        if unknown:
+            raise ValueError("unsupported node patch field(s): {0}".format(", ".join(unknown)))
+        with self._write_lock():
+            data = self.load()
+            graph = data["graphs"].get(str(graph_id))
+            if not isinstance(graph, dict):
+                raise KeyError("unknown graph_id")
+            self._graph_revision_guard(graph, expected_revision)
+            existing = graph["nodes"].get(str(node_id))
+            if not isinstance(existing, dict):
+                raise KeyError("unknown node_id")
+            merged = copy.deepcopy(existing)
+            merged.update(copy.deepcopy(patch))
+            node = normalize_node(
+                node_id=str(node_id),
+                kind=str(merged.get("kind") or "task"),
+                task_id=str(merged.get("task_id") or ""),
+                role=str(merged.get("role") or ""),
+                label=str(merged.get("label") or ""),
+                status=str(merged.get("status") or "ready"),
+                state=merged.get("state"),
+                metadata=merged.get("metadata") or {},
+            )
+            clean_task = str(node.get("task_id") or "")
+            if clean_task and clean_task not in data["tasks"]:
+                raise KeyError("unknown task_id")
+            candidate = copy.deepcopy(graph)
+            candidate["nodes"][str(node_id)] = node
+            validation = graph_validate(
+                candidate,
+                tasks={
+                    str(task_id): task
+                    for task_id, task in data["tasks"].items()
+                    if isinstance(task, dict)
+                },
+            )
+            if not validation.get("ok"):
+                raise RuntimeError(
+                    "graph node update would make graph invalid: {0}".format(
+                        "; ".join(validation.get("errors") or [])
+                    )
+                )
+            graph["nodes"][str(node_id)] = node
+            graph["revision"] = int(graph.get("revision") or 0) + 1
+            graph["updated_at"] = time.time()
+            self.save(data)
+            return {
+                "graph_id": str(graph_id),
+                "revision": int(graph["revision"]),
+                "node": copy.deepcopy(node),
+                "validation": validation,
+            }
+
+    def graph_node_remove(
+        self,
+        graph_id: str,
+        node_id: str,
+        expected_revision: int = -1,
+    ) -> Dict[str, object]:
+        clean_node = str(node_id or "").strip()
+        if not clean_node:
+            raise ValueError("node_id is required")
+        with self._write_lock():
+            data = self.load()
+            graph = data["graphs"].get(str(graph_id))
+            if not isinstance(graph, dict):
+                raise KeyError("unknown graph_id")
+            self._graph_revision_guard(graph, expected_revision)
+            if clean_node not in graph["nodes"]:
+                raise KeyError("unknown node_id")
+            candidate = copy.deepcopy(graph)
+            candidate["nodes"].pop(clean_node, None)
+            removed_edges = [
+                str(edge_id)
+                for edge_id, edge in list(candidate["edges"].items())
+                if isinstance(edge, dict)
+                and (
+                    str(edge.get("source") or "") == clean_node
+                    or str(edge.get("target") or "") == clean_node
+                )
+            ]
+            for edge_id in removed_edges:
+                candidate["edges"].pop(edge_id, None)
+            if (
+                str(data.get("active_graph_id") or "") == str(graph_id)
+                and not candidate["nodes"]
+            ):
+                raise RuntimeError("cannot remove the last node from the active SwarmGraph")
+            graph["nodes"] = candidate["nodes"]
+            graph["edges"] = candidate["edges"]
+            graph["revision"] = int(graph.get("revision") or 0) + 1
+            graph["updated_at"] = time.time()
+            self.save(data)
+            return {
+                "graph_id": str(graph_id),
+                "revision": int(graph["revision"]),
+                "removed_node_id": clean_node,
+                "removed_edge_ids": sorted(removed_edges),
+            }
+
+    def graph_edge_add(
+        self,
+        graph_id: str,
+        source: str,
+        target: str,
+        kind: str = "dependency",
+        condition: object = None,
+        edge_id: str = "",
+        label: str = "",
+        metadata: Optional[Dict[str, object]] = None,
+        expected_revision: int = -1,
+    ) -> Dict[str, object]:
+        with self._write_lock():
+            data = self.load()
+            graph = data["graphs"].get(str(graph_id))
+            if not isinstance(graph, dict):
+                raise KeyError("unknown graph_id")
+            self._graph_revision_guard(graph, expected_revision)
+            clean_edge_id = str(edge_id or "").strip() or "edge_" + uuid.uuid4().hex[:10]
+            edge = normalize_edge(
+                edge_id=clean_edge_id,
+                source=source,
+                target=target,
+                kind=kind,
+                condition=condition,
+                label=label,
+                metadata=metadata,
+            )
+            if clean_edge_id in graph["edges"]:
+                raise ValueError("edge_id already exists")
+            if str(edge["source"]) not in graph["nodes"]:
+                raise KeyError("unknown source node")
+            if str(edge["target"]) not in graph["nodes"]:
+                raise KeyError("unknown target node")
+            candidate = copy.deepcopy(graph)
+            candidate["edges"][clean_edge_id] = edge
+            validation = graph_validate(
+                candidate,
+                tasks={
+                    str(task_id): task
+                    for task_id, task in data["tasks"].items()
+                    if isinstance(task, dict)
+                },
+            )
+            if not validation.get("ok"):
+                raise RuntimeError(
+                    "graph edge would make graph invalid: {0}".format(
+                        "; ".join(validation.get("errors") or [])
+                    )
+                )
+            graph["edges"][clean_edge_id] = edge
+            graph["revision"] = int(graph.get("revision") or 0) + 1
+            graph["updated_at"] = time.time()
+            self.save(data)
+            return {
+                "graph_id": str(graph_id),
+                "revision": int(graph["revision"]),
+                "edge": copy.deepcopy(edge),
+                "validation": validation,
+            }
+
+    def graph_edge_update(
+        self,
+        graph_id: str,
+        edge_id: str,
+        patch: Dict[str, object],
+        expected_revision: int = -1,
+    ) -> Dict[str, object]:
+        if not isinstance(patch, dict) or not patch:
+            raise ValueError("edge patch must be a non-empty object")
+        allowed = {"source", "target", "kind", "condition", "label", "metadata"}
+        unknown = sorted(set(patch) - allowed)
+        if unknown:
+            raise ValueError("unsupported edge patch field(s): {0}".format(", ".join(unknown)))
+        with self._write_lock():
+            data = self.load()
+            graph = data["graphs"].get(str(graph_id))
+            if not isinstance(graph, dict):
+                raise KeyError("unknown graph_id")
+            self._graph_revision_guard(graph, expected_revision)
+            existing = graph["edges"].get(str(edge_id))
+            if not isinstance(existing, dict):
+                raise KeyError("unknown edge_id")
+            merged = copy.deepcopy(existing)
+            merged.update(copy.deepcopy(patch))
+            edge = normalize_edge(
+                edge_id=str(edge_id),
+                source=str(merged.get("source") or ""),
+                target=str(merged.get("target") or ""),
+                kind=str(merged.get("kind") or "dependency"),
+                condition=merged.get("condition"),
+                label=str(merged.get("label") or ""),
+                metadata=merged.get("metadata") or {},
+            )
+            if str(edge["source"]) not in graph["nodes"]:
+                raise KeyError("unknown source node")
+            if str(edge["target"]) not in graph["nodes"]:
+                raise KeyError("unknown target node")
+            candidate = copy.deepcopy(graph)
+            candidate["edges"][str(edge_id)] = edge
+            validation = graph_validate(
+                candidate,
+                tasks={
+                    str(task_id): task
+                    for task_id, task in data["tasks"].items()
+                    if isinstance(task, dict)
+                },
+            )
+            if not validation.get("ok"):
+                raise RuntimeError(
+                    "graph edge update would make graph invalid: {0}".format(
+                        "; ".join(validation.get("errors") or [])
+                    )
+                )
+            graph["edges"][str(edge_id)] = edge
+            graph["revision"] = int(graph.get("revision") or 0) + 1
+            graph["updated_at"] = time.time()
+            self.save(data)
+            return {
+                "graph_id": str(graph_id),
+                "revision": int(graph["revision"]),
+                "edge": copy.deepcopy(edge),
+                "validation": validation,
+            }
+
+    def graph_edge_remove(
+        self,
+        graph_id: str,
+        edge_id: str,
+        expected_revision: int = -1,
+    ) -> Dict[str, object]:
+        clean_edge = str(edge_id or "").strip()
+        if not clean_edge:
+            raise ValueError("edge_id is required")
+        with self._write_lock():
+            data = self.load()
+            graph = data["graphs"].get(str(graph_id))
+            if not isinstance(graph, dict):
+                raise KeyError("unknown graph_id")
+            self._graph_revision_guard(graph, expected_revision)
+            if clean_edge not in graph["edges"]:
+                raise KeyError("unknown edge_id")
+            graph["edges"].pop(clean_edge, None)
+            graph["revision"] = int(graph.get("revision") or 0) + 1
+            graph["updated_at"] = time.time()
+            self.save(data)
+            return {
+                "graph_id": str(graph_id),
+                "revision": int(graph["revision"]),
+                "removed_edge_id": clean_edge,
+            }
+
+    def graph_validate(self, graph_id: str = "") -> Dict[str, object]:
+        data = self.load()
+        clean_id = str(graph_id or "").strip() or str(data.get("active_graph_id") or "")
+        if not clean_id:
+            return {
+                "ok": True,
+                "active": False,
+                "graph_id": "",
+                "errors": [],
+                "warnings": ["no active graph"],
+                "node_count": 0,
+                "edge_count": 0,
+                "task_bindings": {},
+                "entry_nodes": [],
+                "terminal_nodes": [],
+            }
+        graph = data["graphs"].get(clean_id)
+        if not isinstance(graph, dict):
+            raise KeyError("unknown graph_id")
+        result = graph_validate(
+            graph,
+            tasks={
+                str(task_id): task
+                for task_id, task in data["tasks"].items()
+                if isinstance(task, dict)
+            },
+        )
+        result["graph_id"] = clean_id
+        result["revision"] = int(graph.get("revision") or 0)
+        result["active"] = clean_id == str(data.get("active_graph_id") or "")
+        return result
+
+    def interrupt_create(
+        self,
+        prompt: str,
+        task_id: str = "",
+        payload: object = None,
+        interrupt_id: str = "",
+    ) -> Dict[str, object]:
+        """Pause durable work for human input and persist resumable interrupt state."""
+        clean_prompt = str(prompt or "").strip()
+        clean_task = str(task_id or "").strip()
+        if not clean_prompt:
+            raise ValueError("prompt is required")
+        json.dumps(payload, ensure_ascii=False)
+        with self._write_lock():
+            data = self.load()
+            task = None
+            if clean_task:
+                task = data["tasks"].get(clean_task)
+                if not isinstance(task, dict):
+                    raise KeyError("unknown task_id")
+                step_id = str(task.get("superstep_id") or "")
+                step = data["supersteps"].get(step_id) if step_id else None
+                if isinstance(step, dict) and step.get("status") in {"open", "ready"}:
+                    raise RuntimeError(
+                        "task belongs to an active superstep; abort/commit it before interrupting"
+                    )
+
+            active_id = str(interrupt_id or "").strip() or "int_" + uuid.uuid4().hex[:10]
+            if active_id in data["interrupts"]:
+                raise ValueError("interrupt_id already exists")
+            now = time.time()
+            record = {
+                "interrupt_id": active_id,
+                "status": "open",
+                "task_id": clean_task,
+                "prompt": clean_prompt,
+                "payload": payload,
+                "resume_value": None,
+                "created_at": now,
+                "resumed_at": 0.0,
+            }
+            data["interrupts"][active_id] = record
+            if isinstance(task, dict):
+                task["status"] = "blocked"
+                task["summary"] = "human_input: {0}".format(clean_prompt)
+                task["interrupt_id"] = active_id
+                task["claimed_by"] = ""
+                task["lease_expires_at"] = 0.0
+                task["superstep_id"] = ""
+                task["updated_at"] = now
+            self.save(data)
+            return copy.deepcopy(record)
+
+    def interrupt_resume(self, interrupt_id: str, value: object = None) -> Dict[str, object]:
+        """Resume one durable interrupt and make its blocked task runnable again."""
+        clean_id = str(interrupt_id or "").strip()
+        if not clean_id:
+            raise ValueError("interrupt_id is required")
+        json.dumps(value, ensure_ascii=False)
+        with self._write_lock():
+            data = self.load()
+            record = data["interrupts"].get(clean_id)
+            if not isinstance(record, dict):
+                raise KeyError("unknown interrupt_id")
+            if record.get("status") == "resumed":
+                return copy.deepcopy(record)
+            if record.get("status") != "open":
+                raise RuntimeError("interrupt is not open")
+            now = time.time()
+            record["status"] = "resumed"
+            record["resume_value"] = value
+            record["resumed_at"] = now
+
+            task_id = str(record.get("task_id") or "")
+            task = data["tasks"].get(task_id) if task_id else None
+            if (
+                isinstance(task, dict)
+                and str(task.get("interrupt_id") or "") == clean_id
+                and str(task.get("status") or "") == "blocked"
+            ):
+                task["status"] = "ready"
+                task["summary"] = "human_input resolved: {0}".format(
+                    str(record.get("prompt") or "")
+                )
+                task["interrupt_id"] = ""
+                task["retry_after"] = 0.0
+                task["updated_at"] = now
+            self.save(data)
+            return copy.deepcopy(record)
+
+    def interrupts(self, status: str = "") -> List[Dict[str, object]]:
+        clean_status = str(status or "").strip().lower()
+        if clean_status and clean_status not in {"open", "resumed"}:
+            raise ValueError("invalid interrupt status")
+        values = []
+        for item in self.load()["interrupts"].values():
+            if not isinstance(item, dict):
+                continue
+            if clean_status and str(item.get("status") or "").lower() != clean_status:
+                continue
+            values.append(copy.deepcopy(item))
+        return sorted(
+            values,
+            key=lambda item: (item.get("created_at", 0.0), item.get("interrupt_id", "")),
+        )
+
+    def checkpoint_create(
+        self,
+        label: str = "",
+        metadata: Optional[Dict[str, object]] = None,
+        retain: int = 20,
+    ) -> Dict[str, object]:
+        """Persist a bounded coordination-state checkpoint for recovery/time-travel."""
+        json.dumps(metadata or {}, ensure_ascii=False)
+        keep = max(1, min(int(retain or 1), 200))
+        with self._write_lock():
+            data = self.load()
+            checkpoint_id = "cp_" + uuid.uuid4().hex[:10]
+            now = time.time()
+            snapshot = {
+                "tasks": copy.deepcopy(data["tasks"]),
+                "shared_status": copy.deepcopy(data["shared_status"]),
+                "supersteps": copy.deepcopy(data["supersteps"]),
+                "interrupts": copy.deepcopy(data["interrupts"]),
+                "graphs": copy.deepcopy(data["graphs"]),
+                "active_graph_id": str(data.get("active_graph_id") or ""),
+            }
+            record = {
+                "checkpoint_id": checkpoint_id,
+                "label": str(label or "").strip(),
+                "metadata": dict(metadata or {}),
+                "created_at": now,
+                "snapshot": snapshot,
+            }
+            data["checkpoints"][checkpoint_id] = record
+            ordered = sorted(
+                data["checkpoints"].values(),
+                key=lambda item: float(item.get("created_at") or 0.0),
+            )
+            while len(ordered) > keep:
+                oldest = ordered.pop(0)
+                data["checkpoints"].pop(str(oldest.get("checkpoint_id") or ""), None)
+            self.save(data)
+            return {
+                "checkpoint_id": checkpoint_id,
+                "label": record["label"],
+                "metadata": copy.deepcopy(record["metadata"]),
+                "created_at": now,
+            }
+
+    def checkpoints(self) -> List[Dict[str, object]]:
+        values = []
+        for record in self.load()["checkpoints"].values():
+            if not isinstance(record, dict):
+                continue
+            values.append({
+                "checkpoint_id": str(record.get("checkpoint_id") or ""),
+                "label": str(record.get("label") or ""),
+                "metadata": copy.deepcopy(record.get("metadata") or {}),
+                "created_at": float(record.get("created_at") or 0.0),
+            })
+        return sorted(values, key=lambda item: (item["created_at"], item["checkpoint_id"]))
+
+    def checkpoint_restore(self, checkpoint_id: str) -> Dict[str, object]:
+        """Restore durable coordination state while preserving browser bindings/checkpoint history."""
+        clean_id = str(checkpoint_id or "").strip()
+        if not clean_id:
+            raise ValueError("checkpoint_id is required")
+        with self._write_lock():
+            data = self.load()
+            now = time.time()
+            active_leases = [
+                str(task.get("task_id") or "")
+                for task in data["tasks"].values()
+                if isinstance(task, dict)
+                and str(task.get("status") or "") == "active"
+                and float(task.get("lease_expires_at") or 0.0) > now
+            ]
+            active_steps = [
+                str(step.get("step_id") or "")
+                for step in data["supersteps"].values()
+                if isinstance(step, dict) and step.get("status") in {"open", "ready"}
+            ]
+            if active_leases or active_steps:
+                raise RuntimeError(
+                    "cannot restore while active leases/supersteps exist: leases={0}, supersteps={1}".format(
+                        ",".join(active_leases) or "none",
+                        ",".join(active_steps) or "none",
+                    )
+                )
+            record = data["checkpoints"].get(clean_id)
+            if not isinstance(record, dict):
+                raise KeyError("unknown checkpoint_id")
+            snapshot = record.get("snapshot") or {}
+            for key in ("tasks", "shared_status", "supersteps", "interrupts"):
+                value = snapshot.get(key)
+                if not isinstance(value, dict):
+                    raise RuntimeError("checkpoint is missing valid {0}".format(key))
+                data[key] = copy.deepcopy(value)
+            graph_value = snapshot.get("graphs", {})
+            if not isinstance(graph_value, dict):
+                raise RuntimeError("checkpoint is missing valid graphs")
+            data["graphs"] = copy.deepcopy(graph_value)
+            restored_active_graph = str(snapshot.get("active_graph_id") or "")
+            data["active_graph_id"] = (
+                restored_active_graph
+                if restored_active_graph in data["graphs"]
+                else ""
+            )
+
+            recovered_steps = []
+            for step in data["supersteps"].values():
+                if not isinstance(step, dict) or step.get("status") not in {"open", "ready"}:
+                    continue
+                step_id = str(step.get("step_id") or "")
+                step["status"] = "aborted"
+                step["aborted_at"] = now
+                step["error"] = "checkpoint restore invalidated live superstep"
+                if step_id:
+                    recovered_steps.append(step_id)
+
+            for task in data["tasks"].values():
+                if not isinstance(task, dict):
+                    continue
+                if str(task.get("status") or "") == "active":
+                    task["lease_expires_at"] = 0.0
+                if str(task.get("superstep_id") or "") in recovered_steps:
+                    task["superstep_id"] = ""
+                    task["updated_at"] = now
+            self.save(data)
+            return {
+                "checkpoint_id": clean_id,
+                "label": str(record.get("label") or ""),
+                "restored": True,
+                "restored_at": now,
+                "task_count": len(data["tasks"]),
+                "interrupt_count": len(data["interrupts"]),
+                "graph_count": len(data["graphs"]),
+                "active_graph_id": str(data.get("active_graph_id") or ""),
+                "recovered_supersteps": recovered_steps,
+            }

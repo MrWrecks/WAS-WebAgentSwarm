@@ -1,5 +1,6 @@
 """Browser-hosted swarm runtime."""
 
+import copy
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import uuid
 from typing import Dict, List, Optional
 
 from .bridge import BridgeClient
+from .graph import compile_graph
 from .roles import DEFAULT_PRIORITY, DEFAULT_ROLES, plan_roles
 from .state import DurableStore
 
@@ -250,8 +252,9 @@ class SwarmRuntime:
     def coordination_plan(
         self,
         active_roles: Optional[List[str]] = None,
-        max_new_roles: int = 2,
+        max_new_roles: int = 6,
         max_instances_per_role: int = 4,
+        max_total_workers: int = 6,
     ) -> Dict[str, object]:
         """Derive task routing plus same-role instance pressure from durable state."""
         if active_roles is None:
@@ -280,6 +283,26 @@ class SwarmRuntime:
             str(task.get("task_id") or ""): task
             for task in tasks
             if isinstance(task, dict) and str(task.get("task_id") or "")
+        }
+        shared_status = self.store.status()
+        active_graph = self.store.graph_get()
+        compiled_graph = compile_graph(
+            active_graph if active_graph else None,
+            task_map,
+            shared_status,
+        )
+        if compiled_graph.get("active") and not compiled_graph.get("valid", True):
+            return {
+                "ok": False,
+                "error": "active SwarmGraph is invalid",
+                "swarm_graph": compiled_graph,
+            }
+        graph_gates = dict(compiled_graph.get("task_gates") or {})
+        graph_task_nodes = dict(compiled_graph.get("task_node_map") or {})
+        graph_nodes_by_id = {
+            str(item.get("node_id") or ""): item
+            for item in compiled_graph.get("nodes", [])
+            if isinstance(item, dict)
         }
         nodes = []
         edges = []
@@ -320,7 +343,15 @@ class SwarmRuntime:
                 if status == "blocked"
                 else ""
             )
-            role = self._task_role(task, blocker_kind=blocker_kind)
+            graph_gate = graph_gates.get(task_id)
+            graph_node_id = str(graph_task_nodes.get(task_id) or "")
+            graph_node = graph_nodes_by_id.get(graph_node_id) or {}
+            graph_role = str(graph_node.get("role") or "").strip().lower()
+            role = (
+                graph_role
+                if graph_role in DEFAULT_ROLES
+                else self._task_role(task, blocker_kind=blocker_kind)
+            )
             for dep in dependencies:
                 edges.append({"from": dep, "to": task_id, "kind": "dependency"})
 
@@ -370,26 +401,41 @@ class SwarmRuntime:
                     "leased task {0} by {1}".format(task_id, claimed_by)
                 )
             elif status in {"ready", "review"} or lease_expired:
-                route = "dispatch"
-                executable = True
-                frontier.append({
-                    "task_id": task_id,
-                    "role": role,
-                    "status": status,
-                    "payload": task.get("payload"),
-                    "group_id": str(task.get("group_id") or ""),
-                    "recovery": bool(lease_expired),
-                })
-                pressure[role]["score"] += 60 if status == "review" else 50
-                if lease_expired:
-                    pressure[role]["score"] += 20
-                pressure[role]["claimable_task_ids"].append(task_id)
-                pressure[role]["reasons"].append(
-                    "{0} task {1}".format(
-                        "expired-lease" if lease_expired else status,
-                        task_id,
+                if isinstance(graph_gate, dict) and graph_gate.get("unselected"):
+                    route = "graph_unselected"
+                elif isinstance(graph_gate, dict) and not graph_gate.get("ready", False):
+                    route = "wait_graph"
+                    waits.append({
+                        "kind": "graph_gate",
+                        "task_id": task_id,
+                        "role": role,
+                        "graph_id": str(compiled_graph.get("graph_id") or ""),
+                        "graph_node_id": graph_node_id,
+                        "gate": graph_gate,
+                    })
+                else:
+                    route = "dispatch"
+                    executable = True
+                    frontier.append({
+                        "task_id": task_id,
+                        "role": role,
+                        "status": status,
+                        "payload": task.get("payload"),
+                        "group_id": str(task.get("group_id") or ""),
+                        "recovery": bool(lease_expired),
+                        "graph_id": str(compiled_graph.get("graph_id") or ""),
+                        "graph_node_id": graph_node_id,
+                    })
+                    pressure[role]["score"] += 60 if status == "review" else 50
+                    if lease_expired:
+                        pressure[role]["score"] += 20
+                    pressure[role]["claimable_task_ids"].append(task_id)
+                    pressure[role]["reasons"].append(
+                        "{0} task {1}".format(
+                            "expired-lease" if lease_expired else status,
+                            task_id,
+                        )
                     )
-                )
 
             if dependencies:
                 barriers.append({
@@ -415,20 +461,53 @@ class SwarmRuntime:
                 "attempts": int(task.get("attempts") or 0),
                 "max_attempts": int(task.get("max_attempts") or 0),
                 "group_id": str(task.get("group_id") or ""),
+                "graph_node_id": graph_node_id,
+                "graph_gate": copy.deepcopy(graph_gate) if isinstance(graph_gate, dict) else None,
             })
 
         priority_index = {
             role: index
             for index, role in enumerate(DEFAULT_PRIORITY)
         }
+        worker_budget = max(1, min(int(max_total_workers or 1), 32))
+        raw_desired = {}
+        locked_minimum = {}
         for role, row in pressure.items():
             work_units = (
                 len(row["claimable_task_ids"])
                 + len(row["leased_task_ids"])
                 + len(row["interrupt_task_ids"])
             )
+            raw_desired[role] = min(per_role_limit, work_units) if work_units else 0
+            locked_minimum[role] = min(per_role_limit, len(row["leased_task_ids"]))
             row["current_instances"] = int(active_instances.get(role, 0))
-            row["desired_instances"] = min(per_role_limit, work_units) if work_units else 0
+            row["raw_desired_instances"] = int(raw_desired[role])
+            row["locked_minimum_instances"] = int(locked_minimum[role])
+
+        effective_budget = max(worker_budget, sum(locked_minimum.values()))
+        allocated = dict(locked_minimum)
+        budget_order = sorted(
+            pressure.values(),
+            key=lambda item: (
+                -int(item["score"]),
+                priority_index.get(str(item["role"]), len(priority_index)),
+            ),
+        )
+        while sum(allocated.values()) < effective_budget:
+            advanced = False
+            for item in budget_order:
+                role = str(item["role"])
+                if int(allocated.get(role, 0)) >= int(raw_desired.get(role, 0)):
+                    continue
+                allocated[role] = int(allocated.get(role, 0)) + 1
+                advanced = True
+                if sum(allocated.values()) >= effective_budget:
+                    break
+            if not advanced:
+                break
+
+        for role, row in pressure.items():
+            row["desired_instances"] = int(allocated.get(role, 0))
             row["missing_instances"] = max(
                 0,
                 int(row["desired_instances"]) - int(row["current_instances"]),
@@ -496,11 +575,19 @@ class SwarmRuntime:
 
         return {
             "ok": True,
-            "model": "durable_task_graph",
+            "model": (
+                "durable_swarm_graph"
+                if compiled_graph.get("active")
+                else "durable_task_graph"
+            ),
             "graph_semantics": {
                 "conditional_edge": (
-                    "task state selects dispatch/wait_dependencies/wait_retry/"
-                    "leased/interrupt/terminal"
+                    "task state plus explicit SwarmGraph gates select dispatch/wait_graph/"
+                    "graph_unselected/wait_dependencies/wait_retry/leased/interrupt/terminal"
+                ),
+                "explicit_graph": (
+                    "an activated durable SwarmGraph can bind tasks to graph nodes, override "
+                    "worker roles, and gate dispatch through dependency/conditional edges"
                 ),
                 "send_map": (
                     "fan-out shards can target multiple instances of the same role "
@@ -516,6 +603,7 @@ class SwarmRuntime:
             "active_instances": active_instances,
             "task_nodes": nodes,
             "dependency_edges": edges,
+            "swarm_graph": compiled_graph,
             "parallel_frontier": frontier,
             "fan_in_barriers": barriers,
             "waits": waits,
@@ -531,9 +619,12 @@ class SwarmRuntime:
                 "remove_instances": remove_instances,
                 "max_new_workers": add_limit,
                 "max_instances_per_role": per_role_limit,
+                "max_total_workers": worker_budget,
+                "effective_worker_budget": effective_budget,
                 "recommended_instances": recommended_instances,
                 "basis": (
-                    "desired instances from claimable + leased + actionable interrupt work; "
+                    "desired instances from claimable + leased + actionable interrupt work, "
+                    "bounded by a global worker budget while preserving live leased capacity; "
                     "excess instances are eligible for safe scale-in"
                 ),
             },
@@ -541,14 +632,16 @@ class SwarmRuntime:
 
     def elastic_plan(
         self,
-        max_new_roles: int = 2,
+        max_new_roles: int = 6,
         max_instances_per_role: int = 4,
+        max_total_workers: int = 6,
     ) -> Dict[str, object]:
         """Recommend missing-role and same-role runtime instances without browser mutation."""
         coordination = self.coordination_plan(
             active_roles=None,
             max_new_roles=max_new_roles,
             max_instances_per_role=max_instances_per_role,
+            max_total_workers=max_total_workers,
         )
         if not coordination.get("ok"):
             return coordination
@@ -565,11 +658,15 @@ class SwarmRuntime:
             "add_instances": list(recommendation.get("add_instances") or []),
             "remove_roles": list(recommendation.get("remove_roles") or []),
             "remove_instances": list(recommendation.get("remove_instances") or []),
+            "max_total_workers": int(recommendation.get("max_total_workers") or max_total_workers),
+            "effective_worker_budget": int(
+                recommendation.get("effective_worker_budget") or max_total_workers
+            ),
             "coordination": coordination,
             "policy": (
-                "Scale out from durable runnable-shard pressure and leases; scale in only "
-                "durably idle workers after lease/superstep/UI safety checks. Browser idle "
-                "alone is never a scale signal."
+                "Scale out from durable runnable-shard pressure and leases under the global "
+                "worker budget; scale in only durably idle workers after hysteresis plus "
+                "lease/superstep/UI safety checks. Browser idle alone is never a scale signal."
             ),
         }
 
@@ -647,27 +744,36 @@ class SwarmRuntime:
 
     @staticmethod
     def _main_prompt(roles: List[str]) -> str:
+        initial_roles = ", ".join(roles) if roles else "none (main-only bootstrap)"
         return (
             "You are the main Web Agent orchestrator. Initial active worker roles: {0}. "
-            "Read web_agent_swarm_snapshot and web_agent_swarm_coordination_plan. Treat "
-            "task status plus dependency truth as graph routing: dispatch independent "
+            "Read web_agent_swarm_snapshot and web_agent_swarm_coordination_plan first. If an "
+            "active SwarmGraph exists, treat it as the explicit durable execution topology: obey "
+            "its wait_graph/graph_unselected gates, use swarm_graph_* tools for topology/state "
+            "changes, and pass expected_revision when coordinating concurrent graph edits. If this "
+            "is main-only bootstrap, use web_agent_swarm_elastic_plan and web_agent_swarm_scale "
+            "to create only the worker topology justified by the durable parallel frontier. "
+            "Treat task status plus dependency and SwarmGraph truth as graph routing: dispatch independent "
             "parallel_frontier work, respect fan_in_barriers, and treat blocked tasks as "
-            "interrupts. For divisible work, use swarm_task_fanout to create Send-style "
-            "map shards with payloads; multiple instances of the same role may claim separate "
-            "shards concurrently, and swarm_task_reduce aggregates completed shard results. "
-            "For one coordinated round whose outputs must be all-or-nothing, call "
-            "swarm_superstep_begin with the exact worker instances, tell each worker to stage "
-            "pending task_release/status_set writes, and call swarm_superstep_commit only when "
-            "the barrier reports ready_to_commit; any worker failure must abort the round. "
+            "interrupts. For user input, use durable swarm_interrupt_create/resume semantics "
+            "rather than chat memory. For divisible work, use swarm_task_fanout to create "
+            "Send-style map shards with payloads; multiple instances of the same role may claim "
+            "separate shards concurrently, and swarm_task_reduce aggregates completed shard "
+            "results. For one coordinated round whose outputs must be all-or-nothing, call "
+            "swarm_superstep_begin with exact worker instances, stage task_release/status_set "
+            "writes, and commit only when ready_to_commit; any worker failure aborts the round. "
             "Workers must claim/lease tasks before concrete work. Use web_agent_swarm_elastic_plan "
             "to compare durable work pressure with active instance counts, then apply "
-            "web_agent_swarm_scale for recommended add_instances or remove_instances. Scale-in "
-            "must preserve bindings and refuse workers with live leases/supersteps/generation. "
-            "Never scale merely because a browser tab is idle. Do not interrupt generating "
-            "workers. Send one concise instruction per durable next action and avoid duplicate "
-            "instructions. If CodexPro-style local development tools are available, use them "
-            "for concrete repository work and verification rather than guessing."
-        ).format(", ".join(roles))
+            "web_agent_swarm_scale for recommended additions/removals under the global worker "
+            "budget. Automatic scale-in uses hysteresis and must preserve bindings and refuse "
+            "workers with live leases/supersteps/generation. Never scale merely because a browser "
+            "tab is idle. Use swarm_checkpoint_create before risky task-graph or SwarmGraph "
+            "rewrites; checkpoints include graph topology/activation and restore only when no live "
+            "lease/superstep exists. Do not interrupt generating workers. "
+            "Send one concise instruction per durable next action and avoid duplicate instructions. "
+            "If CodexPro-style local development tools are available, use them for concrete "
+            "repository work and verification rather than guessing."
+        ).format(initial_roles)
 
     def _send_when_ready(
         self,
@@ -1001,7 +1107,7 @@ class SwarmRuntime:
 
     def start(
         self,
-        roles: List[str],
+        roles: Optional[List[str]] = None,
         instances: Optional[Dict[str, int]] = None,
         spawn_url: str = "",
         start_watch: bool = True,
@@ -1010,7 +1116,7 @@ class SwarmRuntime:
     ) -> Dict[str, object]:
         selected = []
         target_counts = {}
-        for role in roles:
+        for role in roles or []:
             clean = str(role or "").strip().lower()
             if clean not in DEFAULT_ROLES:
                 return {"ok": False, "error": "unknown role: {0}".format(clean)}
@@ -1031,9 +1137,6 @@ class SwarmRuntime:
                 target_counts.pop(clean, None)
                 if clean in selected:
                     selected.remove(clean)
-
-        if not selected:
-            return {"ok": False, "error": "at least one worker role is required"}
 
         desired_worker_names = set()
         for role in selected:
@@ -1163,6 +1266,7 @@ class SwarmRuntime:
                 and watcher.get("ok", False)
                 and not deactivation_blocked
             ),
+            "bootstrap_mode": "main_only" if not selected else "explicit_workers",
             "worker_roles": selected,
             "worker_instances": {
                 role: int(target_counts[role])
@@ -1181,8 +1285,10 @@ class SwarmRuntime:
         requested_roles: Optional[List[str]] = None,
         requested_instances: Optional[Dict[str, int]] = None,
         worker_count: int = 0,
-        max_new_roles: int = 2,
+        max_new_roles: int = 6,
         max_instances_per_role: int = 4,
+        max_total_workers: int = 6,
+        scale_in_grace_seconds: float = 300.0,
         spawn_url: str = "",
         start_watch: bool = True,
         interval: float = 300.0,
@@ -1203,6 +1309,12 @@ class SwarmRuntime:
         }
         target_counts = dict(current_counts)
         elastic = None
+        automatic_scaling = (
+            requested_instances is None
+            and not requested_roles
+            and not int(worker_count or 0)
+        )
+        grace_seconds = max(0.0, float(scale_in_grace_seconds or 0.0))
 
         if requested_instances is not None:
             for role, count in requested_instances.items():
@@ -1226,6 +1338,7 @@ class SwarmRuntime:
             elastic = self.elastic_plan(
                 max_new_roles=max_new_roles,
                 max_instances_per_role=max_instances_per_role,
+                max_total_workers=max_total_workers,
             )
             if not elastic.get("ok"):
                 return elastic
@@ -1251,6 +1364,20 @@ class SwarmRuntime:
 
         removed_workers = []
         scale_in_blocked = []
+        scale_in_deferred = []
+        scale_in_skipped = []
+        now = time.time()
+
+        for role in DEFAULT_PRIORITY:
+            if int(removals.get(role, 0)) > 0:
+                continue
+            for name in current_map.get(role, []):
+                binding = self.store.bindings().get(name)
+                if isinstance(binding, dict) and binding.get("excess_since"):
+                    updated = dict(binding)
+                    updated.pop("excess_since", None)
+                    self.store.bind(name, updated)
+
         for role in DEFAULT_PRIORITY:
             remaining = int(removals.get(role, 0))
             if remaining <= 0:
@@ -1259,12 +1386,48 @@ class SwarmRuntime:
             for name in candidates:
                 if remaining <= 0:
                     break
+
+                guard = self._worker_suspend_guard(name)
+                if not guard.get("ok"):
+                    scale_in_skipped.append({
+                        "name": name,
+                        "role": role,
+                        "error": "worker has a live durable lease/superstep",
+                        "guard": guard,
+                    })
+                    continue
+
+                if automatic_scaling and grace_seconds > 0:
+                    binding = self.store.bindings().get(name)
+                    since = (
+                        float(binding.get("excess_since") or 0.0)
+                        if isinstance(binding, dict)
+                        else 0.0
+                    )
+                    if since <= 0.0:
+                        updated = dict(binding or {})
+                        updated["excess_since"] = now
+                        self.store.bind(name, updated)
+                        since = now
+                    elapsed = max(0.0, now - since)
+                    if elapsed < grace_seconds:
+                        scale_in_deferred.append({
+                            "name": name,
+                            "role": role,
+                            "excess_since": since,
+                            "elapsed_seconds": elapsed,
+                            "grace_seconds": grace_seconds,
+                            "retry_after": since + grace_seconds,
+                        })
+                        remaining -= 1
+                        continue
+
                 result = self.suspend(name, close_tab=True)
                 if result.get("ok"):
                     removed_workers.append(name)
                     remaining -= 1
                 else:
-                    scale_in_blocked.append({
+                    scale_in_skipped.append({
                         "name": name,
                         "role": role,
                         "error": result.get("error"),
@@ -1342,6 +1505,10 @@ class SwarmRuntime:
                 if current_counts[role] > final_counts[role]
             ],
             "scale_in_blocked": scale_in_blocked,
+            "scale_in_deferred": scale_in_deferred,
+            "scale_in_skipped": scale_in_skipped,
+            "scale_in_grace_seconds": grace_seconds,
+            "max_total_workers": max(1, min(int(max_total_workers or 1), 32)),
             "requested_target_instances": target_counts,
             "previous_worker_instances": current_counts,
             "worker_roles": self._bound_worker_roles(),
@@ -1350,7 +1517,7 @@ class SwarmRuntime:
             "total_web_agents": sum(final_counts.values()) + 1,
             "agents": records,
             "watcher": watcher,
-            "coordination": self.coordination_plan(),
+            "coordination": self.coordination_plan(max_total_workers=max_total_workers),
         }
 
     def send(self, name: str, text: str) -> Dict[str, object]:
@@ -1394,12 +1561,18 @@ class SwarmRuntime:
             for node in coordination.get("task_nodes", [])
             if isinstance(node, dict)
         }
+        route_by_task = {
+            str(node.get("task_id") or ""): str(node.get("route") or "")
+            for node in coordination.get("task_nodes", [])
+            if isinstance(node, dict)
+        }
         tasks = []
         for task in self.store.tasks():
             item = dict(task)
             task_id = str(item.get("task_id") or "")
             if str(item.get("status") or "").lower() == "blocked":
                 item["blocker_kind"] = kind_by_task.get(task_id) or self._blocker_kind(item)
+            item["route"] = route_by_task.get(task_id) or "terminal"
             tasks.append(item)
 
         return {
@@ -1409,6 +1582,10 @@ class SwarmRuntime:
             "tasks": tasks,
             "shared_status": self.store.status(),
             "supersteps": self.store.supersteps(include_pending=False),
+            "interrupts": self.store.interrupts(),
+            "checkpoints": self.store.checkpoints(),
+            "graphs": self.store.graphs(),
+            "active_graph": self.store.graph_get(),
             "coordination": coordination,
             "completion_truth": (
                 "Browser idle means only that the page is not generating. "

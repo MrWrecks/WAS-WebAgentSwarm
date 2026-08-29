@@ -37,7 +37,7 @@ def main(argv=None) -> int:
     plan.add_argument("--roles", nargs="*")
 
     start = sub.add_parser("start")
-    start.add_argument("--roles", nargs="+", required=True)
+    start.add_argument("--roles", nargs="*", default=[])
     start.add_argument("--instances", nargs="*", default=[])
     start.add_argument("--spawn-url", default="")
     start.add_argument("--no-watch", action="store_true")
@@ -46,19 +46,23 @@ def main(argv=None) -> int:
 
     coordination = sub.add_parser("coordination-plan")
     coordination.add_argument("--active-roles", nargs="*")
-    coordination.add_argument("--max-new-roles", type=int, default=2)
+    coordination.add_argument("--max-new-roles", type=int, default=6)
     coordination.add_argument("--max-instances-per-role", type=int, default=4)
+    coordination.add_argument("--max-total-workers", type=int, default=6)
 
     elastic = sub.add_parser("elastic-plan")
-    elastic.add_argument("--max-new-roles", type=int, default=2)
+    elastic.add_argument("--max-new-roles", type=int, default=6)
     elastic.add_argument("--max-instances-per-role", type=int, default=4)
+    elastic.add_argument("--max-total-workers", type=int, default=6)
 
     scale = sub.add_parser("scale")
     scale.add_argument("--workers", type=int, default=0)
     scale.add_argument("--roles", nargs="*")
     scale.add_argument("--instances", nargs="*", default=[])
-    scale.add_argument("--max-new-roles", type=int, default=2)
+    scale.add_argument("--max-new-roles", type=int, default=6)
     scale.add_argument("--max-instances-per-role", type=int, default=4)
+    scale.add_argument("--max-total-workers", type=int, default=6)
+    scale.add_argument("--scale-in-grace", type=float, default=300.0)
     scale.add_argument("--spawn-url", default="")
     scale.add_argument("--no-watch", action="store_true")
     scale.add_argument("--interval", type=float, default=300.0)
@@ -103,8 +107,8 @@ def main(argv=None) -> int:
         emit(swarm.plan(args.workers, args.roles or None))
     elif args.command == "start":
         emit(swarm.start(
-            args.roles,
-            instances=parse_instances(args.instances),
+            args.roles or None,
+            instances=parse_instances(args.instances) or None,
             spawn_url=args.spawn_url,
             start_watch=not args.no_watch,
             interval=args.interval,
@@ -115,19 +119,23 @@ def main(argv=None) -> int:
             active_roles=args.active_roles,
             max_new_roles=args.max_new_roles,
             max_instances_per_role=args.max_instances_per_role,
+            max_total_workers=args.max_total_workers,
         ))
     elif args.command == "elastic-plan":
         emit(swarm.elastic_plan(
             max_new_roles=args.max_new_roles,
             max_instances_per_role=args.max_instances_per_role,
+            max_total_workers=args.max_total_workers,
         ))
     elif args.command == "scale":
         emit(swarm.scale(
             requested_roles=args.roles or None,
-            requested_instances=parse_instances(args.instances),
+            requested_instances=parse_instances(args.instances) or None,
             worker_count=args.workers,
             max_new_roles=args.max_new_roles,
             max_instances_per_role=args.max_instances_per_role,
+            max_total_workers=args.max_total_workers,
+            scale_in_grace_seconds=args.scale_in_grace,
             spawn_url=args.spawn_url,
             start_watch=not args.no_watch,
             interval=args.interval,

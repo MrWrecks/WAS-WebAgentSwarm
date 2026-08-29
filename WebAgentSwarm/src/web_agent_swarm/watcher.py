@@ -10,17 +10,21 @@ from .swarm import SwarmRuntime
 
 
 TICK = (
-    "[WEB_SWARM_TICK] Shared worker/task state changed. "
-    "Call web_agent_swarm_snapshot and web_agent_swarm_coordination_plan. Treat task "
-    "state as graph routing: respect dependencies, retry waits, active leases and blocked "
-    "interrupts. For divisible work, use Send-style swarm_task_fanout shards and let exact "
-    "worker instances claim different shards; use swarm_task_reduce after the group completes. "
-    "If an open/ready superstep exists, inspect its barrier: never publish staged writes early, "
-    "commit only when ready_to_commit, and leave aborted/conflict rounds uncommitted. "
-    "Call web_agent_swarm_elastic_plan when durable pressure changes. Apply "
-    "web_agent_swarm_scale for recommended add_instances or remove_instances; scale-in must "
-    "respect task leases, supersteps and generating tabs. Never scale merely because a browser "
-    "tab is idle, never duplicate a valid lease, and send only a real durable next action."
+    "[WEB_SWARM_TICK] Shared durable state changed. "
+    "Call web_agent_swarm_snapshot and web_agent_swarm_coordination_plan. If an active "
+    "SwarmGraph exists, obey its explicit wait_graph/graph_unselected routes and use revision-safe "
+    "swarm_graph_* mutations. Treat task state as graph routing: respect dependencies, retry waits, active leases, durable human "
+    "interrupts, and blocked work. Resume open human-input waits through swarm_interrupt_resume "
+    "only when input exists; do not infer it from chat memory. For divisible work, use Send-style "
+    "swarm_task_fanout shards and swarm_task_reduce. If an open/ready superstep exists, never "
+    "publish staged writes early; commit only when ready_to_commit. Call "
+    "web_agent_swarm_elastic_plan when durable pressure changes and apply web_agent_swarm_scale "
+    "under the global worker budget. Scale-out follows the runnable parallel frontier; automatic "
+    "scale-in uses hysteresis and must respect task leases, supersteps, and generating tabs. "
+    "A pending excess_since worker is capacity maintenance work and may need a later scale tick. "
+    "Use swarm_checkpoint_create before risky coordination rewrites; restore only when no live "
+    "lease or open superstep exists. Never scale merely because a browser tab is idle, never "
+    "duplicate a valid lease, and send only a real durable next action."
 )
 
 
@@ -65,6 +69,8 @@ def _digest(snapshot: dict) -> str:
         "tasks": snapshot.get("tasks", []),
         "shared_status": snapshot.get("shared_status", {}),
         "supersteps": snapshot.get("supersteps", []),
+        "interrupts": snapshot.get("interrupts", []),
+        "active_graph": snapshot.get("active_graph", {}),
         "transport_alerts": _transport_alerts(snapshot),
     }
     raw = json.dumps(
@@ -82,6 +88,9 @@ def _has_unresolved_work(snapshot: dict) -> bool:
         if not isinstance(task, dict):
             continue
         status = str(task.get("status") or "").strip().lower()
+        route = str(task.get("route") or "").strip().lower()
+        if route in {"graph_unselected", "terminal"}:
+            continue
         if status in {"ready", "review"}:
             retry_after = float(task.get("retry_after") or 0.0)
             if retry_after <= now:
@@ -95,6 +104,21 @@ def _has_unresolved_work(snapshot: dict) -> bool:
 
     for step in snapshot.get("supersteps", []):
         if isinstance(step, dict) and step.get("status") in {"open", "ready"}:
+            return True
+
+    for interrupt in snapshot.get("interrupts", []):
+        if isinstance(interrupt, dict) and interrupt.get("status") == "open":
+            return True
+
+    for agent in snapshot.get("agents", []):
+        if not isinstance(agent, dict) or agent.get("name") == "main":
+            continue
+        binding = agent.get("binding") or {}
+        if (
+            isinstance(binding, dict)
+            and not binding.get("suspended")
+            and float(binding.get("excess_since") or 0.0) > 0.0
+        ):
             return True
     return False
 

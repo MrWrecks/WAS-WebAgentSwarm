@@ -100,6 +100,106 @@ class DurableStoreTest(unittest.TestCase):
             )
 
 
+    def test_durable_interrupt_resume_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DurableStore(Path(tmp))
+            task = store.task_create("Need approval", owner="reviewer", task_id="approval")
+
+            interrupt = store.interrupt_create(
+                "Approve publishing?",
+                task_id=task["task_id"],
+                payload={"change": "publish"},
+                interrupt_id="approval-int",
+            )
+            self.assertEqual(interrupt["status"], "open")
+            blocked = next(item for item in store.tasks() if item["task_id"] == "approval")
+            self.assertEqual(blocked["status"], "blocked")
+            self.assertEqual(blocked["interrupt_id"], "approval-int")
+            self.assertTrue(blocked["summary"].startswith("human_input:"))
+            self.assertEqual(len(store.interrupts(status="open")), 1)
+
+            resumed = store.interrupt_resume("approval-int", value={"approved": True})
+            self.assertEqual(resumed["status"], "resumed")
+            self.assertEqual(resumed["resume_value"], {"approved": True})
+            ready = next(item for item in store.tasks() if item["task_id"] == "approval")
+            self.assertEqual(ready["status"], "ready")
+            self.assertEqual(ready["interrupt_id"], "")
+
+    def test_checkpoint_restore_is_safe_and_restores_coordination_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DurableStore(Path(tmp))
+            task = store.task_create("Checkpoint me", task_id="cp-task")
+            store.status_set("phase", "before")
+            checkpoint = store.checkpoint_create(
+                label="before mutation",
+                metadata={"reason": "test"},
+            )
+
+            store.task_claim(task["task_id"], "implementer", lease_seconds=60)
+            with self.assertRaises(RuntimeError):
+                store.checkpoint_restore(checkpoint["checkpoint_id"])
+
+            store.task_release(
+                task["task_id"],
+                "implementer",
+                status="done",
+                result={"changed": True},
+            )
+            store.status_set("phase", "after")
+
+            restored = store.checkpoint_restore(checkpoint["checkpoint_id"])
+            self.assertTrue(restored["restored"])
+            restored_task = next(
+                item for item in store.tasks() if item["task_id"] == "cp-task"
+            )
+            self.assertEqual(restored_task["status"], "ready")
+            self.assertEqual(restored_task["result"], None)
+            self.assertEqual(store.status()["phase"]["value"], "before")
+            self.assertEqual(
+                store.checkpoints()[0]["checkpoint_id"],
+                checkpoint["checkpoint_id"],
+            )
+
+    def test_checkpoint_restore_invalidates_restored_live_superstep(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DurableStore(Path(tmp))
+            task = store.task_create("Round work", task_id="round-work")
+            store.superstep_begin(["implementer"], step_id="checkpoint-step")
+            store.task_claim(
+                task["task_id"],
+                "implementer",
+                lease_seconds=60,
+                superstep_id="checkpoint-step",
+            )
+            checkpoint = store.checkpoint_create(label="inside round")
+
+            store.superstep_abort("checkpoint-step", reason="finish current timeline")
+            store.task_release(
+                task["task_id"],
+                "implementer",
+                status="done",
+                result={"timeline": "new"},
+            )
+
+            restored = store.checkpoint_restore(checkpoint["checkpoint_id"])
+            self.assertEqual(restored["recovered_supersteps"], ["checkpoint-step"])
+            restored_step = store.superstep_get("checkpoint-step")
+            self.assertEqual(restored_step["status"], "aborted")
+            self.assertIn("checkpoint restore", restored_step["error"])
+
+            restored_task = next(
+                item for item in store.tasks() if item["task_id"] == "round-work"
+            )
+            self.assertEqual(restored_task["status"], "active")
+            self.assertEqual(restored_task["superstep_id"], "")
+            self.assertEqual(restored_task["lease_expires_at"], 0.0)
+            reclaimed = store.task_claim(
+                "round-work",
+                "implementer-2",
+                lease_seconds=60,
+            )
+            self.assertEqual(reclaimed["claimed_by"], "implementer-2")
+
     def test_superstep_pending_writes_commit_atomically(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = DurableStore(Path(tmp))

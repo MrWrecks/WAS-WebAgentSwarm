@@ -47,6 +47,40 @@ class WatcherSemanticsTest(unittest.TestCase):
         }]
         self.assertTrue(_has_unresolved_work(snapshot))
 
+    def test_open_interrupt_is_unresolved_work(self):
+        snapshot = self._snapshot()
+        snapshot["interrupts"] = [{
+            "interrupt_id": "int-1",
+            "status": "open",
+            "prompt": "approve?",
+        }]
+        self.assertTrue(_has_unresolved_work(snapshot))
+
+    def test_pending_scale_in_grace_is_capacity_maintenance_work(self):
+        snapshot = self._snapshot()
+        snapshot["agents"][1]["binding"]["excess_since"] = 1.0
+        self.assertTrue(_has_unresolved_work(snapshot))
+
+        snapshot["agents"][1]["binding"]["suspended"] = True
+        self.assertFalse(_has_unresolved_work(snapshot))
+
+    def test_active_graph_revision_changes_semantic_digest(self):
+        first = self._snapshot()
+        second = self._snapshot()
+        first["active_graph"] = {"graph_id": "g", "revision": 1, "nodes": {}, "edges": {}}
+        second["active_graph"] = {"graph_id": "g", "revision": 2, "nodes": {}, "edges": {}}
+        self.assertNotEqual(_digest(first), _digest(second))
+
+    def test_unselected_graph_branch_is_not_unresolved_work(self):
+        snapshot = self._snapshot()
+        snapshot["tasks"] = [{
+            "task_id": "unused-branch",
+            "status": "ready",
+            "route": "graph_unselected",
+            "retry_after": 0,
+        }]
+        self.assertFalse(_has_unresolved_work(snapshot))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,13 +9,15 @@ when worker state changes.
 ## What this project does
 
 - Open or reuse multiple ChatGPT Web conversations.
-- Assign a main orchestrator and a configurable set of worker roles.
+- Start a main orchestrator alone by default, then elastically create/reuse worker roles from durable parallel pressure; explicit worker sets are still supported.
 - Inspect bounded visible UI state: idle/generating and recent visible messages.
 - Send an exact message to an exact ChatGPT tab or stable conversation binding.
 - Keep a small durable task board and shared status store outside chat history.
 - Recommend a worker count/role subset before opening browser tabs.
+- Persist an explicit mutable `SwarmGraph` with task/control/router/join nodes, dependency/conditional edges, revision-safe edits, and activation/deactivation.
 - Derive dependency-aware conditional routes, fan-out frontiers, fan-in barriers, and interrupts from durable tasks.
-- Elastically add or safely suspend worker instances as durable task pressure changes.
+- Elastically add or safely suspend worker instances as durable task pressure changes, under a global worker budget and scale-in hysteresis.
+- Persist human-input interrupts/resume values and bounded coordination checkpoints for safe recovery/time-travel.
 - Poll durable swarm state every 5 minutes by default; UI-only idle/generating/message changes do not create semantic ticks.
 - Wake the main agent on durable task/superstep changes, actionable transport faults, or a 5-minute unresolved-work safety wake.
 - Start that watcher automatically when a confirmed swarm is launched, and restart it when watcher parameters change.
@@ -70,34 +72,93 @@ CodexPro Lite local development tools
 6. Run:
    `web-agent-swarm health`
 7. Add the two bundled MCP servers to your MCP-capable host using `examples/mcp-config.example.json`.
-8. Tell the main agent something natural like “open a swarm” or “start a few web agents”.
-   It should call the read-only plan tool first, show a proposed worker count/role split,
-   then start only after confirmation.
+8. Tell the controller something natural like “open a swarm”. It should call the read-only
+   plan tool first and start only after confirmation. With no explicit roles, startup opens only
+   the main Web Agent; that main agent reads the durable graph and creates the initial worker
+   topology itself. Pass explicit roles/instances only when you want to pin the initial topology.
 
 See `docs/INSTALL.md` and `docs/ARCHITECTURE.md`.
 
 ## Dynamic swarm startup
 
-The startup flow is intentionally two-stage:
+The startup flow keeps a read-only proposal/confirmation boundary, but worker creation is now
+elastic by default:
 
 ```text
 natural-language intent
         |
         v
-web_agent_swarm_plan
+web_agent_swarm_plan        # read-only proposal
         |
         v
-human confirms or revises roles/count
+human confirms
         |
         v
-web_agent_swarm_start
+web_agent_swarm_start       # no roles => main only
+        |
+        v
+main reads durable graph
+        |
+        v
+elastic_plan -> scale       # initial workers chosen from real parallel pressure
 ```
 
-A user can also explicitly request a direct start with a specific role subset.
+A user can still pin the initial topology with explicit roles/instance counts.
 
 After startup, the main orchestrator uses `web_agent_swarm_coordination_plan`
-to read a durable task graph: dependency-aware conditional routes, fan-in barriers,
-retry waits, active leases, blocked-task interrupts, and per-role instance pressure.
+to read durable task state plus the currently active explicit `SwarmGraph`, if one exists.
+
+### Explicit durable SwarmGraph
+
+`SwarmGraph` is a persisted logical execution topology, separate from the physical browser
+worker pool. A graph contains mutable nodes/edges and a monotonic `revision`:
+
+```text
+Durable SwarmGraph
+    |
+    +-- task node --------> binds durable task_id
+    +-- router/control ---> durable node status/state
+    +-- join/agent/tool --> logical orchestration node
+    |
+    +-- dependency edge --> target waits for source done/skipped
+    +-- conditional edge -> target selected/rejected from structured condition
+    |
+    v
+coordination_plan
+    |
+    +-- dispatch
+    +-- wait_graph
+    +-- graph_unselected
+    |
+    v
+atomic swarm_task_claim gate
+```
+
+Graph mutation is explicit through `swarm_graph_create/get/list/activate/deactivate/update/delete`,
+`swarm_graph_replace`, `swarm_graph_node_add/update/remove`, `swarm_graph_edge_add/update/remove`,
+and `swarm_graph_validate`. `swarm_graph_preview` compiles a draft without activating it. Mutations
+accept `expected_revision`; stale concurrent edits fail with
+a revision conflict instead of silently overwriting another agent's topology.
+
+Task-bound graph nodes may override the worker `role`. An activated graph gates both planning and
+the atomic task lease path, so a worker cannot manually claim a `wait_graph` or
+`graph_unselected` task. Existing valid leases are not preempted by a later graph edit.
+
+Conditional edges never execute arbitrary code. Conditions use a small data DSL with sources
+`source_status`, `source_state`, `task_result`, or `shared_status`, and operators
+`eq/ne/in/not_in/exists/truthy/falsy/gt/gte/lt/lte`. For example:
+
+```json
+{
+  "source": "task_result",
+  "path": "route",
+  "op": "eq",
+  "value": "fast"
+}
+```
+
+If no graph is active, WAS falls back to the existing durable task DAG, so older workflows remain
+compatible.
 
 WAS also implements a lightweight equivalent of LangGraph `Send` + reducer semantics:
 `swarm_task_fanout` creates independent map shards with different payload state,
@@ -108,9 +169,11 @@ leases prevent duplicate execution; retryable failures return to `ready` until
 `max_attempts` is exhausted.
 
 `web_agent_swarm_elastic_plan` compares runnable shard pressure with active instance
-counts, and `web_agent_swarm_scale` may add missing roles **or additional instances of
-an existing role** without tearing down the team. Initial planning/startup is also
-instance-aware via `instance_plan` and `instances={"implementer": 4}`.
+counts and applies a global worker budget (default 6, while never forcing out capacity that
+still owns a live lease). `web_agent_swarm_scale` may add missing roles **or additional
+instances of an existing role**. Automatic scale-in uses a 300-second grace window before a
+safe excess worker is suspended/closed, preventing 3→4→3→4 tab thrashing. Explicit target
+counts bypass that grace because they are direct operator intent.
 
 Tasks can declare dependencies, so downstream work stays behind a durable fan-in
 barrier until prerequisites are `done`. Review work routes to `reviewer`, blocked
@@ -126,6 +189,24 @@ web-agent-swarm scale --instances implementer=6
 
 The second command treats the count as a target total, so it adds only the missing
 `implementer-5` / `implementer-6` instances and preserves the existing workers.
+
+### Durable interrupts and checkpoints
+
+WAS now mirrors two additional LangGraph execution ideas without taking a LangGraph runtime
+dependency:
+
+- `swarm_interrupt_create` persists a human-input pause, optionally attaches it to a task,
+  releases that task's worker lease, and routes it as `human_input`.
+- `swarm_interrupt_resume` stores the resume value and returns the interrupted task to
+  `ready`; the value is durable and is not reconstructed from chat history.
+- `swarm_checkpoint_create` records a bounded snapshot of tasks, shared status, supersteps,
+  interrupts, all SwarmGraphs, and the active graph ID. Old checkpoints are pruned by a retention bound.
+- `swarm_checkpoint_restore` restores that coordination snapshot while preserving browser
+  conversation bindings and checkpoint history. It fails closed while any live task lease or
+  open/ready superstep exists.
+
+This is analogous to LangGraph's persistent interrupt/resume and checkpoint-based time-travel,
+while WAS keeps browser identity outside the restored graph state.
 
 ### Atomic supersteps
 
@@ -173,7 +254,7 @@ server internals are intentionally not claimed as byte-for-byte parity.
 ## Development
 
 ```bash
-python -m unittest discover -s tests -v
+PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
 The browser bridge is intentionally small and dependency-light.

@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -96,6 +97,79 @@ class SwarmRuntimeTest(unittest.TestCase):
             )
             self.assertEqual(bridge.tabs_data, [])
             self.assertEqual(bridge.sent, [])
+
+    def test_main_only_bootstrap_starts_without_workers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = FakeBridge()
+            store = DurableStore(Path(tmp))
+            swarm = SwarmRuntime(bridge=bridge, store=store)
+
+            started = swarm.start(start_watch=False)
+            self.assertTrue(started["ok"])
+            self.assertEqual(started["bootstrap_mode"], "main_only")
+            self.assertEqual(started["worker_count"], 0)
+            self.assertEqual(started["total_web_agents"], 1)
+            self.assertEqual(set(store.bindings()), {"main"})
+            self.assertIn("main-only bootstrap", bridge.sent[0][1])
+
+    def test_global_worker_budget_caps_parallel_pressure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = FakeBridge()
+            store = DurableStore(Path(tmp))
+            swarm = SwarmRuntime(bridge=bridge, store=store)
+            store.task_fanout(
+                items=["i1", "i2", "i3", "i4"],
+                owner="implementer",
+                group_id="impl-budget",
+            )
+            store.task_fanout(
+                items=["t1", "t2", "t3", "t4"],
+                owner="tester",
+                group_id="test-budget",
+            )
+
+            plan = swarm.coordination_plan(
+                active_roles=[],
+                max_new_roles=6,
+                max_instances_per_role=4,
+                max_total_workers=3,
+            )
+            recommended = plan["scale_recommendation"]["recommended_instances"]
+            self.assertEqual(sum(recommended.values()), 3)
+            self.assertGreater(recommended["implementer"], 0)
+            self.assertGreater(recommended["tester"], 0)
+            self.assertEqual(plan["scale_recommendation"]["max_total_workers"], 3)
+
+    def test_automatic_scale_in_uses_grace_period(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = FakeBridge()
+            store = DurableStore(Path(tmp))
+            swarm = SwarmRuntime(bridge=bridge, store=store)
+            started = swarm.start(["implementer"], start_watch=False)
+            self.assertTrue(started["ok"])
+
+            first = swarm.scale(
+                scale_in_grace_seconds=300,
+                start_watch=False,
+            )
+            self.assertTrue(first["ok"])
+            self.assertFalse(first["scaled"])
+            self.assertEqual(first["removed_workers"], [])
+            self.assertEqual(len(first["scale_in_deferred"]), 1)
+            binding = store.bindings()["implementer"]
+            self.assertGreater(float(binding.get("excess_since") or 0.0), 0.0)
+
+            aged = dict(binding)
+            aged["excess_since"] = time.time() - 301.0
+            store.bind("implementer", aged)
+            second = swarm.scale(
+                scale_in_grace_seconds=300,
+                start_watch=False,
+            )
+            self.assertTrue(second["ok"])
+            self.assertTrue(second["scaled"])
+            self.assertEqual(second["removed_workers"], ["implementer"])
+            self.assertEqual(second["worker_count"], 0)
 
     def test_start_subset(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -296,7 +370,7 @@ class SwarmRuntimeTest(unittest.TestCase):
 
             plan = swarm.elastic_plan()
             self.assertTrue(plan["needs_scale_in"])
-            scaled = swarm.scale(start_watch=False)
+            scaled = swarm.scale(scale_in_grace_seconds=0, start_watch=False)
             self.assertTrue(scaled["ok"])
             self.assertTrue(scaled["scaled"])
             self.assertEqual(set(scaled["removed_workers"]), {"implementer", "tester"})
