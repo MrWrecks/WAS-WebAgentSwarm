@@ -14,11 +14,11 @@ class SchedulerBenchmarkTest(unittest.TestCase):
         result = run_scheduler_benchmark()
         self.assertTrue(result["ok"])
         self.assertEqual(result["revision"], BENCHMARK_REVISION)
-        self.assertEqual(result["episode_count"], 5)
-        self.assertEqual(result["passed_count"], 5)
-        self.assertEqual(result["total_reward"], 5)
+        self.assertEqual(result["episode_count"], 7)
+        self.assertEqual(result["passed_count"], 7)
+        self.assertEqual(result["total_reward"], 7)
         self.assertTrue(all(item["passed"] for item in result["episodes"]))
-        self.assertEqual(result["was_version"], "0.5.0")
+        self.assertEqual(result["was_version"], "0.5.1")
         self.assertEqual(len(result["scheduler_source_hash"]), 64)
 
     def test_benchmark_journal_round_trip(self):
@@ -36,7 +36,7 @@ class SchedulerBenchmarkTest(unittest.TestCase):
                 history["runs"][0]["study_id"],
                 result["study_id"],
             )
-            self.assertEqual(history["runs"][0]["total_reward"], 5)
+            self.assertEqual(history["runs"][0]["total_reward"], 7)
 
 
 if __name__ == "__main__":

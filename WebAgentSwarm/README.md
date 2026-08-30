@@ -9,7 +9,9 @@ when worker state changes.
 ## What this project does
 
 - Open or reuse multiple ChatGPT Web conversations.
-- Start a main orchestrator alone by default, then elastically create/reuse worker roles from durable parallel pressure; explicit worker sets are still supported.
+- Start a main orchestrator alone by default, then elastically create/reuse capability-compatible worker slots from durable parallel pressure; explicit worker sets are still supported.
+- Treat task `owner` / `preferred_role` as a scheduling preference, not exclusive ownership; `required_capabilities` plus dependency/resource constraints determine the runnable worker set.
+- Reserve declared task  /  before dispatch so obvious write collisions park as ; MVCC remains the final publication boundary.
 - Inspect bounded visible UI state: idle/generating, recent visible messages, and browser lifecycle state.
 - Protect managed ChatGPT Agent tabs with `autoDiscardable=false`; detect `discarded/frozen/unresponsive` tabs and treat them as transport faults rather than completion.
 - Send an exact message to an exact ChatGPT tab or stable conversation binding.
@@ -258,7 +260,7 @@ web-agent-swarm benchmark
 ```
 
 or call `web_agent_swarm_benchmark` over MCP. The initial benchmark revision
-`was-scheduler-v1` checks five deterministic episodes: single-primary safe sidecars,
+`was-scheduler-v1` checks seven deterministic episodes: single-primary safe sidecars,
 natural four-way fan-out, verification-wait zero pressure, fan-in dependency barriers,
 and the global worker budget. Results include per-episode metrics, invariant evidence,
 latency, and a simple reward so scheduler changes can be compared instead of judged only

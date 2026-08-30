@@ -20,6 +20,52 @@ DEFAULT_PRIORITY = [
     "documenter",
 ]
 
+DEFAULT_CAPABILITIES = {
+    "researcher": {
+        "general", "analysis", "research", "readonly", "web", "python",
+    },
+    "implementer": {
+        "general", "analysis", "implementation", "coding", "python", "write",
+    },
+    "tester": {
+        "general", "analysis", "verification", "testing", "python", "readonly",
+    },
+    "reviewer": {
+        "general", "analysis", "review", "readonly",
+    },
+    "debugger": {
+        "general", "analysis", "debugging", "testing", "python", "readonly",
+    },
+    "documenter": {
+        "general", "analysis", "documentation", "readonly",
+    },
+}
+
+
+def normalize_capabilities(values: Optional[List[object]]) -> List[str]:
+    result = []
+    for value in values or []:
+        clean = str(value or "").strip().lower()
+        if clean and clean not in result:
+            result.append(clean)
+    return result
+
+
+def role_capabilities(role: str) -> List[str]:
+    clean = str(role or "").strip().lower()
+    return sorted(DEFAULT_CAPABILITIES.get(clean, set()))
+
+
+def compatible_roles(required_capabilities: Optional[List[object]]) -> List[str]:
+    required = set(normalize_capabilities(required_capabilities))
+    if not required:
+        return list(DEFAULT_PRIORITY)
+    return [
+        role
+        for role in DEFAULT_PRIORITY
+        if required.issubset(DEFAULT_CAPABILITIES.get(role, set()))
+    ]
+
 
 def plan_roles(
     tasks: List[Dict[str, object]],
@@ -73,11 +119,21 @@ def plan_roles(
         if not runnable:
             continue
         runnable_count += 1
-        owner = str(task.get("owner") or "").strip().lower()
-        if owner in scores:
-            scores[owner] += 100
-        if status == "review":
-            scores["reviewer"] += 50
+        required = normalize_capabilities(task.get("required_capabilities") or [])
+        preferred = str(
+            task.get("preferred_role")
+            or task.get("owner")
+            or ""
+        ).strip().lower()
+        candidates = compatible_roles(required)
+        for role in candidates:
+            scores[role] += 20
+        if status == "review" and "reviewer" in candidates:
+            preferred = "reviewer"
+        if preferred in candidates:
+            scores[preferred] += 60
+        elif preferred in scores and not required:
+            scores[preferred] += 60
 
     ranked = sorted(DEFAULT_PRIORITY, key=lambda role: (-scores[role], DEFAULT_PRIORITY.index(role)))
     if requested:

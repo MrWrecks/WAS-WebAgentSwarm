@@ -13,7 +13,14 @@ from typing import Dict, List, Optional
 
 from .bridge import BridgeClient
 from .graph import compile_graph
-from .roles import DEFAULT_PRIORITY, DEFAULT_ROLES, plan_roles
+from .roles import (
+    DEFAULT_PRIORITY,
+    DEFAULT_ROLES,
+    compatible_roles,
+    normalize_capabilities,
+    plan_roles,
+    role_capabilities,
+)
 from .state import DurableStore
 
 
@@ -143,6 +150,7 @@ class SwarmRuntime:
                     "role": item["role"],
                     "instances": int(item["count"]),
                     "responsibility": DEFAULT_ROLES[item["role"]],
+                    "capabilities": role_capabilities(item["role"]),
                 }
                 for item in instance_plan
             ],
@@ -206,6 +214,7 @@ class SwarmRuntime:
         task: Dict[str, object],
         blocker_kind: str = "",
     ) -> str:
+        """Return a soft preferred role; capability/resource matching is authoritative."""
         status = str(task.get("status") or "").strip().lower()
         if status == "review":
             return "reviewer"
@@ -214,10 +223,58 @@ class SwarmRuntime:
             "unknown_blocker",
         }:
             return "debugger"
-        owner = str(task.get("owner") or "").strip().lower()
-        if owner in DEFAULT_ROLES:
-            return owner
+        preferred = str(
+            task.get("preferred_role")
+            or task.get("owner")
+            or ""
+        ).strip().lower()
+        if preferred in DEFAULT_ROLES:
+            return preferred
         return "implementer"
+
+    @staticmethod
+    def _role_from_worker_name(
+        worker_name: str,
+        bindings: Dict[str, object],
+    ) -> str:
+        clean = str(worker_name or "").strip()
+        binding = bindings.get(clean)
+        if isinstance(binding, dict):
+            role = str(binding.get("role") or "").strip().lower()
+            if role in DEFAULT_ROLES:
+                return role
+        lowered = clean.lower()
+        for role in DEFAULT_ROLES:
+            if lowered == role or lowered.startswith(role + "-"):
+                return role
+        return ""
+
+    @staticmethod
+    def _select_compatible_role(
+        compatible: List[str],
+        preferred: str,
+        active_instances: Dict[str, int],
+        occupied_instances: Dict[str, int],
+        planned_dispatch: Dict[str, int],
+    ) -> str:
+        if not compatible:
+            return ""
+        priority = {role: idx for idx, role in enumerate(DEFAULT_PRIORITY)}
+        available = [
+            role
+            for role in compatible
+            if int(active_instances.get(role, 0))
+            > int(occupied_instances.get(role, 0)) + int(planned_dispatch.get(role, 0))
+        ]
+        pool = available or list(compatible)
+        pool.sort(
+            key=lambda role: (
+                0 if role == preferred else 1,
+                int(planned_dispatch.get(role, 0)),
+                priority.get(role, len(priority)),
+            )
+        )
+        return pool[0] if pool else ""
 
     def _bound_worker_instances(self) -> Dict[str, List[str]]:
         instances = {role: [] for role in DEFAULT_ROLES}
@@ -278,11 +335,29 @@ class SwarmRuntime:
         now = time.time()
 
         tasks = self.store.tasks()
+        durable_state = self.store.load()
+        bindings = dict(durable_state.get("bindings") or {})
         task_map = {
             str(task.get("task_id") or ""): task
             for task in tasks
             if isinstance(task, dict) and str(task.get("task_id") or "")
         }
+        occupied_instances = {role: 0 for role in DEFAULT_ROLES}
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            if str(task.get("status") or "") != "active":
+                continue
+            if float(task.get("lease_expires_at") or 0.0) <= now:
+                continue
+            leased_role = self._role_from_worker_name(
+                str(task.get("claimed_by") or ""),
+                bindings,
+            )
+            if leased_role in occupied_instances:
+                occupied_instances[leased_role] += 1
+        planned_dispatch = {role: 0 for role in DEFAULT_ROLES}
+        capability_gaps = []
         shared_status = self.store.status()
         active_graph = self.store.graph_get()
         compiled_graph = compile_graph(
@@ -355,11 +430,39 @@ class SwarmRuntime:
             graph_node_id = str(graph_task_nodes.get(task_id) or "")
             graph_node = graph_nodes_by_id.get(graph_node_id) or {}
             graph_role = str(graph_node.get("role") or "").strip().lower()
-            role = (
+            preferred_role = (
                 graph_role
                 if graph_role in DEFAULT_ROLES
                 else self._task_role(task, blocker_kind=blocker_kind)
             )
+            required_capabilities = normalize_capabilities(
+                task.get("required_capabilities") or []
+            )
+            if status == "review" and "review" not in required_capabilities:
+                required_capabilities.append("review")
+            if (
+                status == "blocked"
+                and blocker_kind in {"recoverable_failure", "unknown_blocker"}
+                and "debugging" not in required_capabilities
+            ):
+                required_capabilities.append("debugging")
+            if graph_role in DEFAULT_ROLES:
+                compatible = (
+                    [graph_role]
+                    if set(required_capabilities).issubset(set(role_capabilities(graph_role)))
+                    else []
+                )
+            else:
+                compatible = compatible_roles(required_capabilities)
+            role = self._select_compatible_role(
+                compatible,
+                preferred_role,
+                active_instances,
+                occupied_instances,
+                planned_dispatch,
+            )
+            if not role:
+                role = preferred_role if preferred_role in DEFAULT_ROLES else "implementer"
             for dep in dependencies:
                 edges.append({"from": dep, "to": task_id, "kind": "dependency"})
 
@@ -369,6 +472,44 @@ class SwarmRuntime:
             lease_valid = status == "active" and bool(claimed_by) and lease_expires > now
             lease_expired = status == "active" and not lease_valid
             retry_wait = status == "ready" and retry_after > now
+            if lease_valid:
+                leased_role = self._role_from_worker_name(claimed_by, bindings)
+                if leased_role in compatible:
+                    role = leased_role
+            resource_conflicts = []
+            if not lease_valid:
+                canonical_id = self.store._task_canonical_id(task)
+                for candidate in self.store._task_resource_intents(task):
+                    for reservation in (durable_state.get("task_resource_reservations") or {}).values():
+                        if not isinstance(reservation, dict) or reservation.get("status") != "active":
+                            continue
+                        if float(reservation.get("lease_expires_at") or 0.0) <= now:
+                            continue
+                        if str(reservation.get("task_id") or "") == task_id:
+                            continue
+                        held_canonical = str(reservation.get("canonical_id") or "")
+                        if canonical_id and held_canonical and held_canonical != canonical_id:
+                            continue
+                        if self.store._intent_conflicts(candidate, reservation):
+                            resource_conflicts.append({
+                                "requested": candidate["resource"],
+                                "held": str(reservation.get("resource") or ""),
+                                "held_by_task": str(reservation.get("task_id") or ""),
+                            })
+                    for claim in (durable_state.get("resource_claims") or {}).values():
+                        if not isinstance(claim, dict) or claim.get("status") != "active":
+                            continue
+                        if float(claim.get("lease_expires_at") or 0.0) <= now:
+                            continue
+                        held_canonical = str(claim.get("canonical_id") or "")
+                        if canonical_id and held_canonical and held_canonical != canonical_id:
+                            continue
+                        if self.store._intent_conflicts(candidate, claim):
+                            resource_conflicts.append({
+                                "requested": candidate["resource"],
+                                "held": str(claim.get("resource") or ""),
+                                "held_by_run": str(claim.get("run_id") or ""),
+                            })
             route = "terminal"
             executable = False
 
@@ -415,7 +556,26 @@ class SwarmRuntime:
                     "leased task {0} by {1}".format(task_id, claimed_by)
                 )
             elif status in {"ready", "review"} or lease_expired:
-                if isinstance(graph_gate, dict) and graph_gate.get("unselected"):
+                if not compatible:
+                    route = "wait_capability"
+                    gap = {
+                        "kind": "capability_gap",
+                        "task_id": task_id,
+                        "preferred_role": preferred_role,
+                        "required_capabilities": list(required_capabilities),
+                        "graph_role": graph_role,
+                    }
+                    capability_gaps.append(gap)
+                    waits.append(gap)
+                elif resource_conflicts:
+                    route = "wait_resource"
+                    waits.append({
+                        "kind": "resource_conflict",
+                        "task_id": task_id,
+                        "role": role,
+                        "conflicts": copy.deepcopy(resource_conflicts),
+                    })
+                elif isinstance(graph_gate, dict) and graph_gate.get("unselected"):
                     route = "graph_unselected"
                 elif isinstance(graph_gate, dict) and not graph_gate.get("ready", False):
                     route = "wait_graph"
@@ -433,6 +593,10 @@ class SwarmRuntime:
                     frontier.append({
                         "task_id": task_id,
                         "role": role,
+                        "assigned_role": role,
+                        "preferred_role": preferred_role,
+                        "compatible_roles": list(compatible),
+                        "required_capabilities": list(required_capabilities),
                         "status": status,
                         "payload": task.get("payload"),
                         "group_id": str(task.get("group_id") or ""),
@@ -440,6 +604,7 @@ class SwarmRuntime:
                         "graph_id": str(compiled_graph.get("graph_id") or ""),
                         "graph_node_id": graph_node_id,
                     })
+                    planned_dispatch[role] += 1
                     pressure[role]["score"] += 60 if status == "review" else 50
                     if lease_expired:
                         pressure[role]["score"] += 20
@@ -479,7 +644,17 @@ class SwarmRuntime:
             nodes.append({
                 "task_id": task_id,
                 "role": role,
+                "assigned_role": role,
                 "owner": str(task.get("owner") or ""),
+                "preferred_role": preferred_role,
+                "compatible_roles": list(compatible),
+                "required_capabilities": list(required_capabilities),
+                "read_resources": list(task.get("read_resources") or []),
+                "write_resources": list(task.get("write_resources") or []),
+                "exclusive_resources": list(task.get("exclusive_resources") or []),
+                "parallelizable": bool(task.get("parallelizable", True)),
+                "shard_strategy": str(task.get("shard_strategy") or ""),
+                "resource_conflicts": copy.deepcopy(resource_conflicts),
                 "status": status,
                 "route": route,
                 "executable": executable,
@@ -502,6 +677,8 @@ class SwarmRuntime:
 
         for node in nodes:
             if str(node.get("assist_parent_task_id") or ""):
+                continue
+            if not bool(node.get("parallelizable", True)):
                 continue
             if str(node.get("route") or "") not in {"dispatch", "leased"}:
                 continue
@@ -705,12 +882,19 @@ class SwarmRuntime:
                     "graph_unselected/wait_dependencies/wait_retry/leased/interrupt/terminal"
                 ),
                 "explicit_graph": (
-                    "an activated durable SwarmGraph can bind tasks to graph nodes, override "
-                    "worker roles, and gate dispatch through dependency/conditional edges"
+                    "an activated durable SwarmGraph can bind tasks to graph nodes, hard-pin "
+                    "a role when explicitly requested, and gate dispatch through dependency/conditional edges"
+                ),
+                "capability_routing": (
+                    "ordinary owner/preferred_role is soft; required_capabilities selects compatible role profiles, "
+                    "and already-online compatible capacity is preferred before scale-out"
+                ),
+                "resource_intent": (
+                    "declared write/exclusive resources prevent obviously conflicting task dispatch before MVCC lane creation; "
+                    "MVCC remains the final publication/conflict boundary"
                 ),
                 "send_map": (
-                    "fan-out shards can target multiple instances of the same role "
-                    "with different payload state"
+                    "fan-out shards can target compatible workers across role profiles with different payload state"
                 ),
                 "reducer": "group results are aggregated after shard completion",
                 "fan_in": "dependent tasks wait until every dependency is done",
@@ -734,6 +918,7 @@ class SwarmRuntime:
             "fan_in_barriers": barriers,
             "waits": waits,
             "interrupts": interrupts,
+            "capability_gaps": capability_gaps,
             "role_pressure": ranked,
             "scale_recommendation": {
                 "needs_scale": bool(add_instances or remove_instances),
@@ -749,9 +934,10 @@ class SwarmRuntime:
                 "effective_worker_budget": effective_budget,
                 "recommended_instances": recommended_instances,
                 "basis": (
-                    "desired instances only from current claimable/leased/actionable work, including "
-                    "explicit JIT sidecars; dependency-wait future tasks contribute zero worker pressure. "
-                    "Global budget preserves live leased capacity and excess instances may scale in safely"
+                    "desired instances only from capability-compatible current claimable/leased/actionable work, including "
+                    "explicit JIT sidecars; existing compatible online capacity is reused first and dependency/resource-wait "
+                    "future tasks contribute zero worker pressure. Global budget preserves live leased capacity and excess "
+                    "instances may scale in safely"
                 ),
             },
         }
@@ -974,6 +1160,7 @@ class SwarmRuntime:
         self.store.bind(name, {
             "kind": kind,
             "role": role,
+            "capabilities": role_capabilities(role),
             "conversation_id": cid,
             "url_at_bind": url,
             "title_at_bind": str(tab.get("title") or ""),
@@ -991,7 +1178,9 @@ class SwarmRuntime:
     def _worker_prompt(role: str, worker_name: str = "") -> str:
         name = str(worker_name or role)
         return (
-            "You are Web Agent worker instance {0}. Role: {1}. Responsibility: {2} "
+            "You are Web Agent worker instance {0}. Role profile: {1}. Responsibility: {2} "
+            "Your role is a capability profile, not exclusive task ownership. A task owner/preferred_role is a scheduling hint; "
+            "you may claim any durable frontier task whose compatible_roles includes your profile, while explicit SwarmGraph role pins remain hard. "
             "Use durable task state, not chat memory, as coordination truth. Before doing a "
             "concrete task, claim it with swarm_task_claim(task_id, worker_name=\"{0}\"); "
             "heartbeat long work and normally release it with result/evidence when done. If "
@@ -1017,7 +1206,7 @@ class SwarmRuntime:
             "means heartbeat and finish it with swarm_task_step_complete. If a task carries "
             "payload/group_id, treat it as one map shard and return a compact reducer-friendly result. "
             "Be work-conserving: after releasing one task, immediately re-read the coordination plan and "
-            "claim the next eligible task for this exact worker/role in the same turn when useful; stop only "
+            "claim the next capability-compatible eligible task for this worker in the same turn when useful; stop only "
             "when no eligible work remains, a real blocker exists, or the turn budget is nearly exhausted. "
             "If CodexPro-style local development tools are connected, use them for concrete workspace "
             "work and verification. Start by reading the coordination plan and claimable task frontier."
@@ -1028,7 +1217,9 @@ class SwarmRuntime:
         initial_roles = ", ".join(roles) if roles else "none (main-only bootstrap)"
         return (
             "You are the main Web Agent orchestrator. Initial active worker roles: {0}. "
-            "Read web_agent_swarm_snapshot and web_agent_swarm_coordination_plan first. If an "
+            "Read web_agent_swarm_snapshot and web_agent_swarm_coordination_plan first. Treat role as a soft capability profile: "
+            "dispatch by required_capabilities + resource intent + dependencies, prefer already-online compatible worker slots, and only scale out when compatible free capacity is insufficient. "
+            "owner/preferred_role is not exclusive ownership; coordination_plan.assigned_role is the current routing decision. If an "
             "active SwarmGraph exists, treat it as the explicit durable execution topology: obey "
             "its wait_graph/graph_unselected gates, use swarm_graph_* tools for topology/state "
             "changes, and pass expected_revision when coordinating concurrent graph edits. If this "

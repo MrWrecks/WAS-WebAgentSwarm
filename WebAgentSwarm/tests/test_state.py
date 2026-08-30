@@ -45,6 +45,63 @@ class DurableStoreTest(unittest.TestCase):
                     dependencies=["missing"],
                 )
 
+    def test_capability_claim_and_resource_intent_reservation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DurableStore(Path(tmp))
+            verify = store.task_create(
+                "Verify candidate",
+                task_id="verify-cap",
+                preferred_role="tester",
+                required_capabilities=["verification"],
+            )
+            with self.assertRaises(RuntimeError):
+                store.task_claim(verify["task_id"], "implementer", lease_seconds=60)
+            claimed_verify = store.task_claim(
+                verify["task_id"],
+                "tester",
+                lease_seconds=60,
+            )
+            self.assertEqual(claimed_verify["claimed_by"], "tester")
+            store.task_release(verify["task_id"], "tester", status="done")
+
+            first = store.task_create(
+                "Writer one",
+                task_id="writer-one",
+                required_capabilities=["implementation"],
+                write_resources=["src/shared.py"],
+                canonical_root=tmp,
+            )
+            second = store.task_create(
+                "Writer two",
+                task_id="writer-two",
+                required_capabilities=["implementation"],
+                write_resources=["src/shared.py"],
+                canonical_root=tmp,
+            )
+            store.task_claim(first["task_id"], "implementer", lease_seconds=60)
+            active = [
+                item
+                for item in store.load()["task_resource_reservations"].values()
+                if item.get("status") == "active"
+            ]
+            self.assertEqual(len(active), 1)
+            self.assertEqual(active[0]["resource"], "src/shared.py")
+            with self.assertRaises(RuntimeError):
+                store.task_claim(second["task_id"], "implementer-2", lease_seconds=60)
+
+            store.task_release(first["task_id"], "implementer", status="done")
+            self.assertFalse(any(
+                item.get("status") == "active"
+                and item.get("task_id") == first["task_id"]
+                for item in store.load()["task_resource_reservations"].values()
+            ))
+            reclaimed = store.task_claim(
+                second["task_id"],
+                "implementer-2",
+                lease_seconds=60,
+            )
+            self.assertEqual(reclaimed["claimed_by"], "implementer-2")
+
     def test_claim_lease_retry_and_reduce(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = DurableStore(Path(tmp))

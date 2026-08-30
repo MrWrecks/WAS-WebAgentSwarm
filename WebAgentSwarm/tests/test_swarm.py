@@ -240,6 +240,81 @@ class SwarmRuntimeTest(unittest.TestCase):
             )
             self.assertEqual(scaled["added_roles"], ["reviewer"])
 
+    def test_capability_routing_reuses_online_worker_and_waits_on_write_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = FakeBridge()
+            store = DurableStore(Path(tmp))
+            swarm = SwarmRuntime(bridge=bridge, store=store)
+
+            store.task_create(
+                "Generic analysis",
+                owner="researcher",
+                preferred_role="researcher",
+                required_capabilities=["analysis"],
+                task_id="analysis-flex",
+            )
+            plan = swarm.coordination_plan(
+                active_roles=["tester"],
+                max_new_roles=2,
+            )
+            node = next(
+                item for item in plan["task_nodes"]
+                if item["task_id"] == "analysis-flex"
+            )
+            self.assertEqual(node["route"], "dispatch")
+            self.assertEqual(node["assigned_role"], "tester")
+            self.assertIn("researcher", node["compatible_roles"])
+            self.assertEqual(plan["scale_recommendation"]["add_roles"], [])
+
+            store.task_update("analysis-flex", status="done", summary="complete")
+            first = store.task_create(
+                "Primary writer",
+                task_id="writer-a",
+                required_capabilities=["implementation"],
+                write_resources=["src/shared.py"],
+                canonical_root=tmp,
+            )
+            second = store.task_create(
+                "Secondary writer",
+                task_id="writer-b",
+                required_capabilities=["implementation"],
+                write_resources=["src/shared.py"],
+                canonical_root=tmp,
+            )
+            store.task_claim(first["task_id"], "implementer", lease_seconds=60)
+            conflict_plan = swarm.coordination_plan(
+                active_roles=["implementer", "implementer"],
+                max_new_roles=2,
+            )
+            conflict = next(
+                item for item in conflict_plan["task_nodes"]
+                if item["task_id"] == second["task_id"]
+            )
+            self.assertEqual(conflict["route"], "wait_resource")
+            self.assertTrue(conflict["resource_conflicts"])
+            self.assertNotIn(
+                second["task_id"],
+                {item["task_id"] for item in conflict_plan["parallel_frontier"]},
+            )
+
+    def test_parallelizable_false_suppresses_auto_sidecars(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DurableStore(Path(tmp))
+            swarm = SwarmRuntime(store=store)
+            store.task_create(
+                "Serial critical section",
+                owner="implementer",
+                task_id="serial-primary",
+                parallelizable=False,
+            )
+            plan = swarm.coordination_plan(active_roles=[])
+            self.assertFalse(any(
+                item.get("parent_task_id") == "serial-primary"
+                for item in plan["sidecar_opportunities"]
+            ))
+            ensured = swarm.ensure_parallelism()
+            self.assertEqual(ensured["count"], 0)
+
     def test_coordination_plan_routes_dependencies_and_blocked_interrupt(self):
         with tempfile.TemporaryDirectory() as tmp:
             bridge = FakeBridge()
@@ -271,9 +346,15 @@ class SwarmRuntimeTest(unittest.TestCase):
                 if item["task_id"] == "implement"
             )
             self.assertEqual(barrier["unresolved"], ["research"])
+            research = next(
+                item for item in waiting["task_nodes"]
+                if item["task_id"] == "research"
+            )
+            self.assertEqual(research["assigned_role"], "implementer")
+            self.assertIn("researcher", research["compatible_roles"])
             self.assertEqual(
                 waiting["scale_recommendation"]["add_roles"],
-                ["researcher"],
+                [],
             )
 
             store.task_update("research", status="done", summary="evidence ready")

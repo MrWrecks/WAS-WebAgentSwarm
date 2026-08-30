@@ -13,8 +13,8 @@ from . import __version__
 from .state import DurableStore, default_state_dir
 from .swarm import SwarmRuntime
 
-BENCHMARK_REVISION = "was-scheduler-v1"
-SOURCE_FILES = ("state.py", "swarm.py", "watcher.py", "benchmark.py")
+BENCHMARK_REVISION = "was-scheduler-v2"
+SOURCE_FILES = ("roles.py", "state.py", "swarm.py", "mvcc.py", "watcher.py", "benchmark.py")
 
 
 def _scheduler_source_hash() -> str:
@@ -231,6 +231,90 @@ def run_scheduler_benchmark(
             },
         }
 
+    def capability_slot_reuse(store, runtime):
+        store.task_create(
+            "Flexible analysis",
+            owner="researcher",
+            preferred_role="researcher",
+            required_capabilities=["analysis"],
+            task_id="flex-analysis",
+        )
+        plan = runtime.coordination_plan(
+            active_roles=["tester"],
+            max_total_workers=6,
+        )
+        metrics = _plan_metrics(plan)
+        node = next(
+            item for item in plan["task_nodes"]
+            if item.get("task_id") == "flex-analysis"
+        )
+        recommendation = plan.get("scale_recommendation") or {}
+        passed = (
+            node.get("route") == "dispatch"
+            and node.get("assigned_role") == "tester"
+            and "researcher" in (node.get("compatible_roles") or [])
+            and recommendation.get("add_roles") == []
+        )
+        return {
+            "passed": passed,
+            "reward": 1 if passed else 0,
+            "metrics": metrics,
+            "evidence": {
+                "preferred_role": node.get("preferred_role"),
+                "assigned_role": node.get("assigned_role"),
+                "compatible_roles": list(node.get("compatible_roles") or []),
+            },
+        }
+
+    def resource_intent_serialization(store, runtime):
+        first = store.task_create(
+            "Writer A",
+            task_id="writer-a",
+            required_capabilities=["implementation"],
+            write_resources=["src/shared.py"],
+            canonical_root=str(store.root),
+        )
+        second = store.task_create(
+            "Writer B",
+            task_id="writer-b",
+            required_capabilities=["implementation"],
+            write_resources=["src/shared.py"],
+            canonical_root=str(store.root),
+        )
+        store.task_claim(first["task_id"], "implementer", lease_seconds=60)
+        blocked_plan = runtime.coordination_plan(
+            active_roles=["implementer", "implementer"],
+            max_total_workers=6,
+        )
+        blocked_node = next(
+            item for item in blocked_plan["task_nodes"]
+            if item.get("task_id") == second["task_id"]
+        )
+        store.task_release(first["task_id"], "implementer", status="done")
+        ready_plan = runtime.coordination_plan(
+            active_roles=["implementer"],
+            max_total_workers=6,
+        )
+        ready_node = next(
+            item for item in ready_plan["task_nodes"]
+            if item.get("task_id") == second["task_id"]
+        )
+        passed = (
+            blocked_node.get("route") == "wait_resource"
+            and bool(blocked_node.get("resource_conflicts"))
+            and ready_node.get("route") == "dispatch"
+        )
+        return {
+            "passed": passed,
+            "reward": 1 if passed else 0,
+            "metrics": _plan_metrics(ready_plan),
+            "evidence": {
+                "blocked_route": blocked_node.get("route"),
+                "conflict_count": len(blocked_node.get("resource_conflicts") or []),
+                "after_release_route": ready_node.get("route"),
+            },
+        }
+
     def worker_budget(store, runtime):
         owners = ["implementer", "tester", "reviewer", "researcher", "debugger", "documenter"]
         for index in range(12):
@@ -258,6 +342,8 @@ def run_scheduler_benchmark(
         ("natural_fanout", natural_fanout),
         ("verification_wait_zero_pressure", verification_wait),
         ("fan_in_barrier", fan_in),
+        ("capability_slot_reuse", capability_slot_reuse),
+        ("resource_intent_serialization", resource_intent_serialization),
         ("global_worker_budget", worker_budget),
     ]:
         episodes.append(_episode(name, setup))

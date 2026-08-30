@@ -110,22 +110,23 @@ compiled task gates
     +--> durable task DAG
     |      wait_dependencies / wait_retry / leased / interrupt / terminal
     |
-    +--> swarm_task_fanout(items, owner)       # Send-style map
+    +--> swarm_task_fanout(items, capabilities/resources)  # Send-style map
     |      +--> shard 0 payload
     |      +--> shard 1 payload
     |      +--> shard N payload
     |               |
+    |               +--> capability/resource match
     |               +--> exact worker instance task claim + lease
-    |                       implementer
-    |                       implementer-2
-    |                       implementer-3
+    |                       tester / researcher / implementer / ...
     |
     +--> swarm_task_reduce(group_id)           # stable reducer
     |
     v
 web_agent_swarm_coordination_plan
     |
-    +--> runnable + leased + interrupt work units per role
+    +--> required_capabilities + resource-intent conflict filtering
+    +--> reuse free compatible online slots before scale-out
+    +--> runnable + leased + interrupt work units per assigned role profile
     +--> desired_instances vs active_instances
     |
     v
@@ -167,6 +168,12 @@ never force-removed just to satisfy the configured budget. Second, automatic sca
 `excess_since` timestamp and waits through a default 300-second grace window before closing a
 safe surplus worker. Explicit operator target counts bypass that grace. A worker with a live task
 lease, open/ready superstep participation, or a generating browser tab still cannot be suspended.
+
+Before an MVCC lane exists, task-level  /  are reserved
+atomically with the task lease. Conflicting ready work routes to ; the same check is
+repeated on . Task heartbeat renews these reservations and every normal release,
+superstep commit, or interrupt transition releases them. These reservations are an early scheduling
+guard only: filesystem MVCC claims/base hashes remain the final publication authority.
 
 Mutating durable state uses a cross-process lock plus atomic file replacement so concurrent
 browser agents cannot safely-by-accident overwrite each other's claims. Graph edits add a second

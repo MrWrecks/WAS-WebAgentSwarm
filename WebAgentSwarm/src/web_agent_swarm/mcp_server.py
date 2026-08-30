@@ -492,8 +492,15 @@ def swarm_task_create(
     assist_write_policy: str = "",
     resource_hints: list = None,
     canonical_root: str = "",
+    preferred_role: str = "",
+    required_capabilities: list = None,
+    read_resources: list = None,
+    write_resources: list = None,
+    exclusive_resources: list = None,
+    parallelizable: bool = True,
+    shard_strategy: str = "",
 ):
-    """Create a durable task with dependency, payload, grouping and retry metadata."""
+    """Create a durable task with capability, resource-intent, dependency and retry metadata."""
     return store.task_create(
         title,
         description,
@@ -508,6 +515,13 @@ def swarm_task_create(
         assist_write_policy=assist_write_policy,
         resource_hints=resource_hints,
         canonical_root=canonical_root,
+        preferred_role=preferred_role,
+        required_capabilities=required_capabilities,
+        read_resources=read_resources,
+        write_resources=write_resources,
+        exclusive_resources=exclusive_resources,
+        parallelizable=parallelizable,
+        shard_strategy=shard_strategy,
     )
 
 
@@ -672,13 +686,20 @@ def swarm_task_release(
 @mcp.tool
 def swarm_task_fanout(
     items: list,
-    owner: str,
+    owner: str = "",
     title_prefix: str = "Shard",
     dependencies: list = None,
     group_id: str = "",
     max_attempts: int = 3,
+    preferred_role: str = "",
+    required_capabilities: list = None,
+    read_resources: list = None,
+    write_resources: list = None,
+    exclusive_resources: list = None,
+    canonical_root: str = "",
+    shard_strategy: str = "map",
 ):
-    """Create Send-style map shards sharing one reducer group."""
+    """Create capability-aware Send-style map shards sharing one reducer group."""
     return store.task_fanout(
         items,
         owner,
@@ -686,6 +707,13 @@ def swarm_task_fanout(
         dependencies=dependencies,
         group_id=group_id,
         max_attempts=max_attempts,
+        preferred_role=preferred_role,
+        required_capabilities=required_capabilities,
+        read_resources=read_resources,
+        write_resources=write_resources,
+        exclusive_resources=exclusive_resources,
+        canonical_root=canonical_root,
+        shard_strategy=shard_strategy,
     )
 
 

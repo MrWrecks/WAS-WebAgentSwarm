@@ -11,12 +11,30 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from .graph import compile_graph, graph_validate, normalize_edge, normalize_node
+from .mvcc import normalize_resource, resources_overlap
+from .roles import DEFAULT_ROLES, normalize_capabilities, role_capabilities
 
 ASSIST_KINDS = {
-    "readonly_analysis": {"owner": "researcher", "write_policy": "readonly"},
-    "verification": {"owner": "tester", "write_policy": "experiment_only"},
-    "disjoint_write": {"owner": "implementer", "write_policy": "disjoint_write"},
-    "proposal_only": {"owner": "reviewer", "write_policy": "proposal_only"},
+    "readonly_analysis": {
+        "owner": "researcher",
+        "write_policy": "readonly",
+        "required_capabilities": ["analysis", "readonly"],
+    },
+    "verification": {
+        "owner": "tester",
+        "write_policy": "experiment_only",
+        "required_capabilities": ["verification"],
+    },
+    "disjoint_write": {
+        "owner": "implementer",
+        "write_policy": "disjoint_write",
+        "required_capabilities": ["implementation", "write"],
+    },
+    "proposal_only": {
+        "owner": "reviewer",
+        "write_policy": "proposal_only",
+        "required_capabilities": ["review"],
+    },
 }
 ASSIST_WRITE_POLICIES = {"readonly", "experiment_only", "disjoint_write", "proposal_only"}
 
@@ -71,10 +89,11 @@ class DurableStore:
 
     def _empty(self) -> Dict[str, object]:
         return {
-            "schema_version": 10,
+            "schema_version": 11,
             "bindings": {},
             "tasks": {},
             "task_steps": {},
+            "task_resource_reservations": {},
             "checkpoint_head_id": "",
             "shared_status": {},
             "supersteps": {},
@@ -130,6 +149,15 @@ class DurableStore:
                 task.setdefault("assist_write_policy", "")
                 task.setdefault("resource_hints", [])
                 task.setdefault("canonical_root", "")
+                task.setdefault("preferred_role", str(task.get("owner") or "").strip().lower())
+                task["required_capabilities"] = normalize_capabilities(
+                    task.get("required_capabilities") or []
+                )
+                task.setdefault("read_resources", [])
+                task.setdefault("write_resources", [])
+                task.setdefault("exclusive_resources", [])
+                task.setdefault("parallelizable", True)
+                task.setdefault("shard_strategy", "")
         for graph_id, graph in list(base["graphs"].items()):
             if not isinstance(graph, dict):
                 base["graphs"].pop(graph_id, None)
@@ -173,6 +201,121 @@ class DurableStore:
     def bindings(self) -> Dict[str, object]:
         return dict(self.load()["bindings"])
 
+    @staticmethod
+    def _task_resource_list(values: Optional[List[object]]) -> List[str]:
+        result = []
+        for raw in values or []:
+            resource = str(raw.get("resource") or "") if isinstance(raw, dict) else str(raw or "")
+            if not resource.strip():
+                continue
+            normalized = normalize_resource(resource)["resource"]
+            if normalized not in result:
+                result.append(normalized)
+        return result
+
+    @staticmethod
+    def _worker_role(data: Dict[str, object], worker_name: str) -> str:
+        clean_worker = str(worker_name or "").strip().lower()
+        binding = (data.get("bindings") or {}).get(clean_worker)
+        if isinstance(binding, dict):
+            role = str(binding.get("role") or "").strip().lower()
+            if role in DEFAULT_ROLES:
+                return role
+        for role in DEFAULT_ROLES:
+            if clean_worker == role or clean_worker.startswith(role + "-"):
+                return role
+        return ""
+
+    @classmethod
+    def _worker_capabilities(cls, data: Dict[str, object], worker_name: str) -> List[str]:
+        clean_worker = str(worker_name or "").strip()
+        binding = (data.get("bindings") or {}).get(clean_worker)
+        if isinstance(binding, dict):
+            explicit = normalize_capabilities(binding.get("capabilities") or [])
+            if explicit:
+                return explicit
+        return role_capabilities(cls._worker_role(data, clean_worker))
+
+    @staticmethod
+    def _task_canonical_id(task: Dict[str, object]) -> str:
+        root = str(task.get("canonical_root") or "").strip()
+        if not root:
+            return ""
+        try:
+            normalized = os.path.normcase(str(Path(root).expanduser().resolve()))
+        except (OSError, RuntimeError, ValueError):
+            normalized = root
+        return "canon_" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+    @classmethod
+    def _task_resource_intents(cls, task: Dict[str, object]) -> List[Dict[str, str]]:
+        intents = []
+        seen = set()
+        for mode, values in (("write", task.get("write_resources") or []), ("exclusive", task.get("exclusive_resources") or [])):
+            for resource in cls._task_resource_list(values):
+                normalized = normalize_resource(resource)
+                key = (normalized["resource"], mode)
+                if key in seen:
+                    continue
+                seen.add(key)
+                normalized["mode"] = mode
+                intents.append(normalized)
+        return intents
+
+    @staticmethod
+    def _intent_conflicts(left: Dict[str, object], right: Dict[str, object]) -> bool:
+        if not resources_overlap(left, right):
+            return False
+        modes = {str(left.get("mode") or "write"), str(right.get("mode") or "write")}
+        if "scratch" in modes:
+            return False
+        if "exclusive" in modes:
+            return True
+        if modes == {"read"}:
+            return False
+        if str(left.get("namespace") or "") == "path" and str(right.get("namespace") or "") == "path" and modes == {"read", "write"}:
+            return False
+        return "write" in modes
+
+    @classmethod
+    def _reserve_task_resources(cls, data: Dict[str, object], task: Dict[str, object], worker_name: str, lease_expires_at: float, now: float) -> List[Dict[str, object]]:
+        task_id = str(task.get("task_id") or "")
+        canonical_id = cls._task_canonical_id(task)
+        requested = cls._task_resource_intents(task)
+        if not requested:
+            return []
+        conflicts = []
+        for candidate in requested:
+            for reservation in (data.get("task_resource_reservations") or {}).values():
+                if not isinstance(reservation, dict) or reservation.get("status") != "active":
+                    continue
+                if float(reservation.get("lease_expires_at") or 0.0) <= now or str(reservation.get("task_id") or "") == task_id:
+                    continue
+                held_canonical = str(reservation.get("canonical_id") or "")
+                if canonical_id and held_canonical and held_canonical != canonical_id:
+                    continue
+                if cls._intent_conflicts(candidate, reservation):
+                    conflicts.append({"requested": candidate["resource"], "requested_mode": candidate["mode"], "held": str(reservation.get("resource") or ""), "held_mode": str(reservation.get("mode") or ""), "held_by_task": str(reservation.get("task_id") or ""), "held_by_worker": str(reservation.get("worker_name") or "")})
+            for claim in (data.get("resource_claims") or {}).values():
+                if not isinstance(claim, dict) or claim.get("status") != "active":
+                    continue
+                if float(claim.get("lease_expires_at") or 0.0) <= now:
+                    continue
+                held_canonical = str(claim.get("canonical_id") or "")
+                if canonical_id and held_canonical and held_canonical != canonical_id:
+                    continue
+                if cls._intent_conflicts(candidate, claim):
+                    conflicts.append({"requested": candidate["resource"], "requested_mode": candidate["mode"], "held": str(claim.get("resource") or ""), "held_mode": str(claim.get("mode") or ""), "held_by_run": str(claim.get("run_id") or "")})
+        if conflicts:
+            raise RuntimeError("task resource intent conflict: " + json.dumps(conflicts, ensure_ascii=False))
+        reservations = []
+        for candidate in requested:
+            reservation_id = "taskres_" + uuid.uuid4().hex[:12]
+            record = {"reservation_id": reservation_id, "task_id": task_id, "worker_name": str(worker_name or ""), "canonical_id": canonical_id, "resource": candidate["resource"], "namespace": candidate["namespace"], "path": candidate["path"], "mode": candidate["mode"], "status": "active", "lease_expires_at": float(lease_expires_at), "created_at": now, "updated_at": now}
+            data["task_resource_reservations"][reservation_id] = record
+            reservations.append(record)
+        return reservations
+
     def task_create(
         self,
         title: str,
@@ -190,6 +333,13 @@ class DurableStore:
         assist_write_policy: str = "",
         resource_hints: Optional[List[object]] = None,
         canonical_root: str = "",
+        preferred_role: str = "",
+        required_capabilities: Optional[List[object]] = None,
+        read_resources: Optional[List[object]] = None,
+        write_resources: Optional[List[object]] = None,
+        exclusive_resources: Optional[List[object]] = None,
+        parallelizable: bool = True,
+        shard_strategy: str = "",
     ) -> Dict[str, object]:
         clean_title = str(title or "").strip()
         if not clean_title:
@@ -222,11 +372,35 @@ class DurableStore:
             clean_write_policy = str(assist_write_policy or "").strip().lower()
             if clean_write_policy and clean_write_policy not in ASSIST_WRITE_POLICIES:
                 raise ValueError("unknown assist_write_policy: {0}".format(clean_write_policy))
+            clean_owner = str(owner or "").strip().lower()
+            clean_preferred = str(preferred_role or clean_owner).strip().lower()
+            if clean_preferred and clean_preferred not in DEFAULT_ROLES:
+                raise ValueError("unknown preferred_role: {0}".format(clean_preferred))
+            clean_capabilities = normalize_capabilities(required_capabilities or [])
+            if not clean_capabilities and clean_assist_kind:
+                clean_capabilities = normalize_capabilities(
+                    ASSIST_KINDS[clean_assist_kind].get("required_capabilities") or []
+                )
+            clean_read_resources = self._task_resource_list(read_resources)
+            clean_write_resources = self._task_resource_list(write_resources)
+            clean_exclusive_resources = self._task_resource_list(exclusive_resources)
+            if clean_assist_kind and not (clean_read_resources or clean_write_resources):
+                if clean_write_policy == "disjoint_write":
+                    clean_write_resources = self._task_resource_list(resource_hints)
+                elif clean_write_policy in {"readonly", "proposal_only", "experiment_only"}:
+                    clean_read_resources = self._task_resource_list(resource_hints)
             task = {
                 "task_id": active_id,
                 "title": clean_title,
                 "description": str(description or "").strip(),
-                "owner": str(owner or "").strip(),
+                "owner": clean_owner,
+                "preferred_role": clean_preferred,
+                "required_capabilities": clean_capabilities,
+                "read_resources": clean_read_resources,
+                "write_resources": clean_write_resources,
+                "exclusive_resources": clean_exclusive_resources,
+                "parallelizable": bool(parallelizable),
+                "shard_strategy": str(shard_strategy or "").strip().lower(),
                 "dependencies": deps,
                 "payload": payload,
                 "group_id": str(group_id or "").strip(),
@@ -308,6 +482,13 @@ class DurableStore:
                 "title": clean_title,
                 "description": str(description or "").strip(),
                 "owner": clean_owner,
+                "preferred_role": clean_owner,
+                "required_capabilities": normalize_capabilities(defaults.get("required_capabilities") or []),
+                "read_resources": self._task_resource_list(resource_hints if clean_policy in {"readonly", "proposal_only", "experiment_only"} else []),
+                "write_resources": self._task_resource_list(resource_hints if clean_policy == "disjoint_write" else []),
+                "exclusive_resources": [],
+                "parallelizable": True,
+                "shard_strategy": "sidecar",
                 "dependencies": [],
                 "payload": payload,
                 "group_id": "",
@@ -641,6 +822,13 @@ class DurableStore:
             task = data["tasks"].get(str(task_id))
             if not isinstance(task, dict):
                 raise KeyError("unknown task_id")
+            required_capabilities = set(normalize_capabilities(task.get("required_capabilities") or []))
+            worker_capabilities = set(self._worker_capabilities(data, clean_worker))
+            if required_capabilities and not required_capabilities.issubset(worker_capabilities):
+                missing = sorted(required_capabilities - worker_capabilities)
+                raise RuntimeError(
+                    "worker lacks required task capabilities: {0}".format(",".join(missing))
+                )
             now = time.time()
             live_lanes = [
                 lane
@@ -716,11 +904,8 @@ class DurableStore:
                             {},
                         )
                         expected_role = str(graph_node.get("role") or "").strip().lower()
-                        if (
-                            expected_role
-                            and clean_worker != expected_role
-                            and not clean_worker.startswith(expected_role + "-")
-                        ):
+                        worker_role = self._worker_role(data, clean_worker)
+                        if expected_role and worker_role != expected_role:
                             raise RuntimeError(
                                 "task SwarmGraph role requires worker role {0}".format(
                                     expected_role
@@ -743,11 +928,33 @@ class DurableStore:
                 existing = data["supersteps"].get(existing_step)
                 if isinstance(existing, dict) and existing.get("status") in {"open", "ready"}:
                     raise RuntimeError("task is already bound to active superstep {0}".format(existing_step))
+            new_expiry = now + max(1, int(lease_seconds or 1))
+            active_reservations = [
+                reservation
+                for reservation in data.get("task_resource_reservations", {}).values()
+                if isinstance(reservation, dict)
+                and reservation.get("status") == "active"
+                and str(reservation.get("task_id") or "") == str(task_id)
+                and str(reservation.get("worker_name") or "") == clean_worker
+                and float(reservation.get("lease_expires_at") or 0.0) > now
+            ]
+            if existing_valid_owner and active_reservations:
+                for reservation in active_reservations:
+                    reservation["lease_expires_at"] = new_expiry
+                    reservation["updated_at"] = now
+            else:
+                self._reserve_task_resources(
+                    data,
+                    task,
+                    clean_worker,
+                    new_expiry,
+                    now,
+                )
             task["attempts"] = attempts
             task["status"] = "active"
             task["superstep_id"] = clean_step
             task["claimed_by"] = clean_worker
-            task["lease_expires_at"] = now + max(1, int(lease_seconds or 1))
+            task["lease_expires_at"] = new_expiry
             task["updated_at"] = now
             self.save(data)
             return dict(task)
@@ -772,6 +979,15 @@ class DurableStore:
             new_expiry = now + max(1, int(lease_seconds or 1))
             task["lease_expires_at"] = new_expiry
             task["updated_at"] = now
+            for reservation in data.get("task_resource_reservations", {}).values():
+                if (
+                    isinstance(reservation, dict)
+                    and reservation.get("status") == "active"
+                    and str(reservation.get("task_id") or "") == str(task_id)
+                    and str(reservation.get("worker_name") or "") == clean_worker
+                ):
+                    reservation["lease_expires_at"] = new_expiry
+                    reservation["updated_at"] = now
             for lane in data["lanes"].values():
                 if (
                     isinstance(lane, dict)
@@ -856,17 +1072,34 @@ class DurableStore:
             task["claimed_by"] = ""
             task["lease_expires_at"] = 0.0
             task["updated_at"] = now
+            for reservation in data.get("task_resource_reservations", {}).values():
+                if (
+                    isinstance(reservation, dict)
+                    and reservation.get("status") == "active"
+                    and str(reservation.get("task_id") or "") == str(task_id)
+                    and str(reservation.get("worker_name") or "") == clean_worker
+                ):
+                    reservation["status"] = "released"
+                    reservation["lease_expires_at"] = 0.0
+                    reservation["updated_at"] = now
             self.save(data)
             return dict(task)
 
     def task_fanout(
         self,
         items: List[object],
-        owner: str,
+        owner: str = "",
         title_prefix: str = "Shard",
         dependencies: Optional[List[str]] = None,
         group_id: str = "",
         max_attempts: int = 3,
+        preferred_role: str = "",
+        required_capabilities: Optional[List[object]] = None,
+        read_resources: Optional[List[object]] = None,
+        write_resources: Optional[List[object]] = None,
+        exclusive_resources: Optional[List[object]] = None,
+        canonical_root: str = "",
+        shard_strategy: str = "map",
     ) -> Dict[str, object]:
         values = list(items or [])
         if not values:
@@ -883,6 +1116,14 @@ class DurableStore:
                     group_id=clean_group,
                     group_index=index - 1,
                     max_attempts=max_attempts,
+                    preferred_role=preferred_role,
+                    required_capabilities=required_capabilities,
+                    read_resources=read_resources,
+                    write_resources=write_resources,
+                    exclusive_resources=exclusive_resources,
+                    canonical_root=canonical_root,
+                    parallelizable=True,
+                    shard_strategy=shard_strategy,
                 )
             )
         return {
@@ -1153,6 +1394,16 @@ class DurableStore:
         task["claimed_by"] = ""
         task["lease_expires_at"] = 0.0
         task["updated_at"] = now
+        for reservation in data.get("task_resource_reservations", {}).values():
+            if (
+                isinstance(reservation, dict)
+                and reservation.get("status") == "active"
+                and str(reservation.get("task_id") or "") == str(task.get("task_id") or "")
+                and str(reservation.get("worker_name") or "") == worker_name
+            ):
+                reservation["status"] = "released"
+                reservation["lease_expires_at"] = 0.0
+                reservation["updated_at"] = now
 
     def superstep_commit(self, step_id: str) -> Dict[str, object]:
         with self._write_lock():
@@ -2026,6 +2277,7 @@ class DurableStore:
             }
             data["interrupts"][active_id] = record
             if isinstance(task, dict):
+                previous_worker = str(task.get("claimed_by") or "")
                 task["status"] = "blocked"
                 task["summary"] = "human_input: {0}".format(clean_prompt)
                 task["interrupt_id"] = active_id
@@ -2033,6 +2285,16 @@ class DurableStore:
                 task["lease_expires_at"] = 0.0
                 task["superstep_id"] = ""
                 task["updated_at"] = now
+                for reservation in data.get("task_resource_reservations", {}).values():
+                    if (
+                        isinstance(reservation, dict)
+                        and reservation.get("status") == "active"
+                        and str(reservation.get("task_id") or "") == clean_task
+                        and (not previous_worker or str(reservation.get("worker_name") or "") == previous_worker)
+                    ):
+                        reservation["status"] = "released"
+                        reservation["lease_expires_at"] = 0.0
+                        reservation["updated_at"] = now
             self.save(data)
             return copy.deepcopy(record)
 
