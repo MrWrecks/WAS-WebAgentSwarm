@@ -8,6 +8,7 @@ except ImportError as exc:
     ) from exc
 
 from .bridge import BridgeClient
+from .mvcc import LaneManager
 from .state import DurableStore
 from .swarm import SwarmRuntime
 
@@ -15,6 +16,7 @@ from .swarm import SwarmRuntime
 mcp = FastMCP("Web Agent Swarm")
 bridge = BridgeClient()
 store = DurableStore()
+lanes = LaneManager(store)
 swarm = SwarmRuntime(bridge=bridge, store=store)
 
 
@@ -140,6 +142,110 @@ def web_agent_swarm_send(name: str, text: str):
     return swarm.send(name, text)
 
 
+
+
+
+
+@mcp.tool
+def swarm_lane_start(
+    task_id: str,
+    worker_name: str,
+    canonical_root: str,
+    resources: list,
+    lease_seconds: int = 900,
+    run_id: str = "",
+    parent_run_id: str = "",
+):
+    """Create one isolated MVCC development lane after verifying the task lease and hierarchical resource claims."""
+    return lanes.start(
+        task_id=task_id,
+        worker_name=worker_name,
+        canonical_root=canonical_root,
+        resources=resources,
+        lease_seconds=lease_seconds,
+        run_id=run_id,
+        parent_run_id=parent_run_id,
+    )
+
+
+@mcp.tool
+def swarm_lane_get(lane_id: str):
+    """Read one MVCC lane with its run and currently-live resource claims."""
+    return lanes.get(lane_id)
+
+
+@mcp.tool
+def swarm_lane_list(status: str = ""):
+    """List MVCC lanes, optionally filtered by status."""
+    return lanes.list(status=status)
+
+
+@mcp.tool
+def swarm_run_list(status: str = ""):
+    """List durable MVCC runs, optionally filtered by status."""
+    return lanes.runs(status=status)
+
+
+@mcp.tool
+def swarm_resource_claim(
+    run_id: str,
+    resource: str,
+    mode: str = "write",
+    lease_seconds: int = 900,
+):
+    """Add hierarchical read/write/scratch claim; scratch may mutate only inside the lane and is never published."""
+    return lanes.claim_resource(
+        run_id=run_id,
+        resource=resource,
+        mode=mode,
+        lease_seconds=lease_seconds,
+    )
+
+
+@mcp.tool
+def swarm_resource_claim_list(status: str = ""):
+    """List durable resource claims and their ownership/lease status."""
+    return lanes.claims(status=status)
+
+
+@mcp.tool
+def swarm_lane_heartbeat(lane_id: str, lease_seconds: int = 900):
+    """Renew all currently-live resource claims belonging to one MVCC lane."""
+    return lanes.heartbeat(lane_id, lease_seconds=lease_seconds)
+
+
+@mcp.tool
+def swarm_lane_commit(lane_id: str):
+    """Validate read/write sets against canonical base hashes and publish the whole lane or return conflict without overwrite."""
+    return lanes.commit(lane_id)
+
+
+@mcp.tool
+def swarm_lane_recover():
+    """Recover any crash-interrupted MVCC commit by rolling canonical back from its pre-publish journal."""
+    return lanes.recover_incomplete_commits()
+
+
+@mcp.tool
+def swarm_lane_fork(lane_id: str, lease_seconds: int = 900):
+    """Fork a conflicted/aborted lane from the latest canonical workspace as a new run/lane."""
+    return lanes.fork(lane_id, lease_seconds=lease_seconds)
+
+
+@mcp.tool
+def swarm_lane_abort(
+    lane_id: str,
+    reason: str = "aborted by worker",
+    cleanup: bool = False,
+):
+    """Abort a lane, release its resource claims, and optionally remove the private workspace."""
+    return lanes.abort(lane_id, reason=reason, cleanup=cleanup)
+
+
+@mcp.tool
+def swarm_commit_list(status: str = ""):
+    """List durable MVCC commit attempts including conflicts and committed writes."""
+    return lanes.commits(status=status)
 
 
 @mcp.tool
@@ -350,6 +456,11 @@ def swarm_task_create(
     group_id: str = "",
     parent_task_id: str = "",
     max_attempts: int = 3,
+    assist_parent_task_id: str = "",
+    assist_kind: str = "",
+    assist_write_policy: str = "",
+    resource_hints: list = None,
+    canonical_root: str = "",
 ):
     """Create a durable task with dependency, payload, grouping and retry metadata."""
     return store.task_create(
@@ -361,7 +472,46 @@ def swarm_task_create(
         group_id=group_id,
         parent_task_id=parent_task_id,
         max_attempts=max_attempts,
+        assist_parent_task_id=assist_parent_task_id,
+        assist_kind=assist_kind,
+        assist_write_policy=assist_write_policy,
+        resource_hints=resource_hints,
+        canonical_root=canonical_root,
     )
+
+
+@mcp.tool
+def swarm_task_assist(
+    parent_task_id: str,
+    title: str,
+    description: str = "",
+    owner: str = "",
+    assist_kind: str = "readonly_analysis",
+    write_policy: str = "",
+    resource_hints: list = None,
+    canonical_root: str = "",
+    payload: object = None,
+    max_attempts: int = 2,
+):
+    """Create a JIT sidecar that runs in parallel with its primary task."""
+    return store.task_assist(
+        parent_task_id=parent_task_id,
+        title=title,
+        description=description,
+        owner=owner,
+        assist_kind=assist_kind,
+        write_policy=write_policy,
+        resource_hints=resource_hints,
+        canonical_root=canonical_root,
+        payload=payload,
+        max_attempts=max_attempts,
+    )
+
+
+@mcp.tool
+def swarm_task_assist_list(parent_task_id: str, include_terminal: bool = True):
+    """List sidecar tasks attached to one primary task."""
+    return store.task_assists(parent_task_id, include_terminal=include_terminal)
 
 
 @mcp.tool

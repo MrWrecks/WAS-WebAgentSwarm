@@ -310,6 +310,9 @@ class SwarmRuntime:
         barriers = []
         waits = []
         interrupts = []
+        parallel_sidecars = []
+        sidecar_opportunities = []
+        live_sidecar_parents = set()
         pressure = {
             role: {
                 "role": role,
@@ -318,6 +321,7 @@ class SwarmRuntime:
                 "claimable_task_ids": [],
                 "leased_task_ids": [],
                 "interrupt_task_ids": [],
+                "sidecar_task_ids": [],
                 "reasons": [],
             }
             for role in DEFAULT_ROLES
@@ -328,6 +332,11 @@ class SwarmRuntime:
                 continue
             task_id = str(task.get("task_id") or "")
             status = str(task.get("status") or "").strip().lower()
+            assist_parent_task_id = str(task.get("assist_parent_task_id") or "")
+            assist_kind = str(task.get("assist_kind") or "")
+            assist_write_policy = str(task.get("assist_write_policy") or "")
+            if assist_parent_task_id and status not in {"done", "failed", "cancelled"}:
+                live_sidecar_parents.add(assist_parent_task_id)
             dependencies = [
                 str(item)
                 for item in task.get("dependencies", [])
@@ -437,6 +446,22 @@ class SwarmRuntime:
                         )
                     )
 
+            if assist_parent_task_id and status not in {"done", "failed", "cancelled"}:
+                pressure[role]["sidecar_task_ids"].append(task_id)
+                parallel_sidecars.append({
+                    "task_id": task_id,
+                    "parent_task_id": assist_parent_task_id,
+                    "role": role,
+                    "assist_kind": assist_kind,
+                    "write_policy": assist_write_policy,
+                    "resource_hints": list(task.get("resource_hints") or []),
+                    "canonical_root": str(task.get("canonical_root") or ""),
+                    "status": status,
+                    "route": route,
+                    "executable": executable,
+                    "claimed_by": claimed_by,
+                })
+
             if dependencies:
                 barriers.append({
                     "task_id": task_id,
@@ -461,9 +486,98 @@ class SwarmRuntime:
                 "attempts": int(task.get("attempts") or 0),
                 "max_attempts": int(task.get("max_attempts") or 0),
                 "group_id": str(task.get("group_id") or ""),
+                "assist_parent_task_id": assist_parent_task_id,
+                "assist_kind": assist_kind,
+                "assist_write_policy": assist_write_policy,
+                "resource_hints": list(task.get("resource_hints") or []),
+                "canonical_root": str(task.get("canonical_root") or ""),
                 "graph_node_id": graph_node_id,
                 "graph_gate": copy.deepcopy(graph_gate) if isinstance(graph_gate, dict) else None,
             })
+
+        for node in nodes:
+            if str(node.get("assist_parent_task_id") or ""):
+                continue
+            if str(node.get("route") or "") not in {"dispatch", "leased"}:
+                continue
+            parent_task_id = str(node.get("task_id") or "")
+            if not parent_task_id or parent_task_id in live_sidecar_parents:
+                continue
+            primary_role = str(node.get("role") or "")
+            suggestions = []
+            if primary_role == "implementer":
+                suggestions = [
+                    {
+                        "assist_kind": "verification",
+                        "role": "tester",
+                        "write_policy": "experiment_only",
+                        "purpose": "Run independent regression/reproduction while the primary writes code.",
+                    },
+                    {
+                        "assist_kind": "proposal_only",
+                        "role": "reviewer",
+                        "write_policy": "proposal_only",
+                        "purpose": "Review the same code/problem and return a patch/test proposal without competing writes.",
+                    },
+                ]
+            elif primary_role == "debugger":
+                suggestions = [
+                    {
+                        "assist_kind": "readonly_analysis",
+                        "role": "researcher",
+                        "write_policy": "readonly",
+                        "purpose": "Independently mine evidence and alternative root-cause hypotheses.",
+                    },
+                    {
+                        "assist_kind": "verification",
+                        "role": "tester",
+                        "write_policy": "experiment_only",
+                        "purpose": "Build a minimal reproduction or verify the leading hypothesis.",
+                    },
+                ]
+            elif primary_role == "researcher":
+                suggestions = [{
+                    "assist_kind": "proposal_only",
+                    "role": "reviewer",
+                    "write_policy": "proposal_only",
+                    "purpose": "Challenge assumptions and validate evidence in parallel.",
+                }]
+            elif primary_role == "tester":
+                suggestions = [{
+                    "assist_kind": "readonly_analysis",
+                    "role": "debugger",
+                    "write_policy": "readonly",
+                    "purpose": "Analyze failures while the tester runs the verification matrix.",
+                }]
+            elif primary_role == "reviewer":
+                suggestions = [{
+                    "assist_kind": "readonly_analysis",
+                    "role": "researcher",
+                    "write_policy": "readonly",
+                    "purpose": "Gather missing evidence while review proceeds.",
+                }]
+            elif primary_role == "documenter":
+                suggestions = [{
+                    "assist_kind": "proposal_only",
+                    "role": "reviewer",
+                    "write_policy": "proposal_only",
+                    "purpose": "Fact-check the draft without touching the documenter's write set.",
+                }]
+            if suggestions:
+                task = task_map.get(parent_task_id) or {}
+                sidecar_opportunities.append({
+                    "parent_task_id": parent_task_id,
+                    "title": str(task.get("title") or ""),
+                    "primary_role": primary_role,
+                    "primary_route": str(node.get("route") or ""),
+                    "canonical_root": str(task.get("canonical_root") or ""),
+                    "resource_hints": list(task.get("resource_hints") or []),
+                    "suggestions": suggestions,
+                    "policy": (
+                        "Create a sidecar only when the work is genuinely orthogonal. "
+                        "Do not create workers merely to fill capacity."
+                    ),
+                })
 
         priority_index = {
             role: index
@@ -598,6 +712,11 @@ class SwarmRuntime:
                 "interrupt": "blocked tasks are surfaced to the main orchestrator",
                 "lease": "claim/heartbeat prevents duplicate shard execution",
                 "retry": "retryable failures return to ready until max_attempts",
+                "sidecar": (
+                    "JIT assist tasks run beside a current primary task; readonly/proposal/verification "
+                    "sidecars do not compete for the primary write-set, while disjoint_write sidecars "
+                    "must pass hierarchical MVCC claims"
+                ),
             },
             "active_roles": normalized_active,
             "active_instances": active_instances,
@@ -605,6 +724,8 @@ class SwarmRuntime:
             "dependency_edges": edges,
             "swarm_graph": compiled_graph,
             "parallel_frontier": frontier,
+            "parallel_sidecars": parallel_sidecars,
+            "sidecar_opportunities": sidecar_opportunities,
             "fan_in_barriers": barriers,
             "waits": waits,
             "interrupts": interrupts,
@@ -623,9 +744,9 @@ class SwarmRuntime:
                 "effective_worker_budget": effective_budget,
                 "recommended_instances": recommended_instances,
                 "basis": (
-                    "desired instances from claimable + leased + actionable interrupt work, "
-                    "bounded by a global worker budget while preserving live leased capacity; "
-                    "excess instances are eligible for safe scale-in"
+                    "desired instances only from current claimable/leased/actionable work, including "
+                    "explicit JIT sidecars; dependency-wait future tasks contribute zero worker pressure. "
+                    "Global budget preserves live leased capacity and excess instances may scale in safely"
                 ),
             },
         }
@@ -663,6 +784,8 @@ class SwarmRuntime:
                 recommendation.get("effective_worker_budget") or max_total_workers
             ),
             "coordination": coordination,
+            "parallel_sidecars": list(coordination.get("parallel_sidecars") or []),
+            "sidecar_opportunities": list(coordination.get("sidecar_opportunities") or []),
             "policy": (
                 "Scale out from durable runnable-shard pressure and leases under the global "
                 "worker budget; scale in only durably idle workers after hysteresis plus "
@@ -736,10 +859,22 @@ class SwarmRuntime:
             "operations with swarm_superstep_stage; "
             "on failure call swarm_superstep_fail. The main agent alone commits the ready barrier. "
             "Multiple workers may share your role, so never work an unclaimed task in parallel "
-            "with another instance. If a task carries payload/group_id, treat it as one map shard "
-            "and return a compact reducer-friendly result. If CodexPro-style local development "
-            "tools are connected, use them for concrete workspace work and verification. Start "
-            "by reading the coordination plan and claimable task frontier."
+            "with another instance. If this is an assist task, obey assist_write_policy strictly: "
+            "readonly/proposal_only/experiment_only sidecars must not take canonical write claims; "
+            "same-file assistance returns evidence, tests, or a concrete proposal to the primary writer. "
+            "Only disjoint_write sidecars may write project files, and their MVCC write claims must be "
+            "non-overlapping with the primary. For any repository mutation or experiment with filesystem "
+            "outputs, create an MVCC lane with swarm_lane_start after the task lease, using read/scratch "
+            "claims for non-writing sidecars and write claims only when policy permits. Open the returned "
+            "lane workspace in CodexPro and mutate/run commands only there; canonical mutation is guarded. "
+            "Heartbeat long lanes, call swarm_lane_commit before task_release, and on conflict preserve "
+            "the old lane and use swarm_lane_fork/rebase rather than overwriting. If a task carries "
+            "payload/group_id, treat it as one map shard and return a compact reducer-friendly result. "
+            "Be work-conserving: after releasing one task, immediately re-read the coordination plan and "
+            "claim the next eligible task for this exact worker/role in the same turn when useful; stop only "
+            "when no eligible work remains, a real blocker exists, or the turn budget is nearly exhausted. "
+            "If CodexPro-style local development tools are connected, use them for concrete workspace "
+            "work and verification. Start by reading the coordination plan and claimable task frontier."
         ).format(name, role, DEFAULT_ROLES[role])
 
     @staticmethod
@@ -752,8 +887,14 @@ class SwarmRuntime:
             "its wait_graph/graph_unselected gates, use swarm_graph_* tools for topology/state "
             "changes, and pass expected_revision when coordinating concurrent graph edits. If this "
             "is main-only bootstrap, use web_agent_swarm_elastic_plan and web_agent_swarm_scale "
-            "to create only the worker topology justified by the durable parallel frontier. "
-            "Treat task status plus dependency and SwarmGraph truth as graph routing: dispatch independent "
+            "to create only the worker topology justified by the durable parallel frontier. Never open "
+            "workers for future dependency-wait stages. Inspect sidecar_opportunities for each current "
+            "dispatch/leased primary: when there is genuinely orthogonal work, create one or two JIT helpers "
+            "with swarm_task_assist before scaling. Prefer readonly_analysis, verification, or disjoint_write "
+            "sidecars. If a helper needs to inspect the same files the primary is writing, make it "
+            "proposal_only/readonly: one primary writer owns that write-set and the helper returns evidence, "
+            "tests, or a concrete patch proposal rather than competing for the same file. Do not create "
+            "sidecars merely to keep tabs busy. Treat task status plus dependency and SwarmGraph truth as graph routing: dispatch independent "
             "parallel_frontier work, respect fan_in_barriers, and treat blocked tasks as "
             "interrupts. For user input, use durable swarm_interrupt_create/resume semantics "
             "rather than chat memory. For divisible work, use swarm_task_fanout to create "
@@ -762,7 +903,11 @@ class SwarmRuntime:
             "results. For one coordinated round whose outputs must be all-or-nothing, call "
             "swarm_superstep_begin with exact worker instances, stage task_release/status_set "
             "writes, and commit only when ready_to_commit; any worker failure aborts the round. "
-            "Workers must claim/lease tasks before concrete work. Use web_agent_swarm_elastic_plan "
+            "Workers must claim/lease tasks before concrete work. Repository-changing work must "
+            "also use a resource-scoped MVCC lane: assign canonical_root/resources, require lane-only "
+            "CodexPro mutation/experiments, and require swarm_lane_commit before task release. Resource "
+            "claims are hierarchical, and commit validates base/read/write versions; conflict must fork "
+            "or rebase and never overwrite canonical. Use web_agent_swarm_elastic_plan "
             "to compare durable work pressure with active instance counts, then apply "
             "web_agent_swarm_scale for recommended additions/removals under the global worker "
             "budget. Automatic scale-in uses hysteresis and must preserve bindings and refuse "
@@ -1575,6 +1720,7 @@ class SwarmRuntime:
             item["route"] = route_by_task.get(task_id) or "terminal"
             tasks.append(item)
 
+        durable = self.store.load()
         return {
             "ok": True,
             "bridge": self.bridge.health(),
@@ -1586,6 +1732,13 @@ class SwarmRuntime:
             "checkpoints": self.store.checkpoints(),
             "graphs": self.store.graphs(),
             "active_graph": self.store.graph_get(),
+            "runs": list(durable.get("runs", {}).values()),
+            "lanes": list(durable.get("lanes", {}).values()),
+            "resource_claims": list(durable.get("resource_claims", {}).values()),
+            "commits": list(durable.get("commits", {}).values()),
+            "resource_versions": durable.get("resource_versions", {}),
+            "canonical_epoch": int(durable.get("canonical_epoch") or 0),
+            "canonical_epochs": durable.get("canonical_epochs", {}),
             "coordination": coordination,
             "completion_truth": (
                 "Browser idle means only that the page is not generating. "

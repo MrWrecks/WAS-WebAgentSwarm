@@ -51,34 +51,44 @@ def plan_roles(
         }
 
     scores = {role: len(DEFAULT_PRIORITY) - idx for idx, role in enumerate(DEFAULT_PRIORITY)}
-    live_task_count = 0
+    task_map = {
+        str(task.get("task_id") or ""): task
+        for task in tasks
+        if isinstance(task, dict) and str(task.get("task_id") or "")
+    }
+    runnable_count = 0
     for task in tasks:
         if not isinstance(task, dict):
             continue
         status = str(task.get("status") or "").lower()
-        if status in {"done", "failed"}:
+        dependencies = [str(item) for item in task.get("dependencies", []) if str(item)]
+        unresolved = [
+            dep for dep in dependencies
+            if task_map.get(dep, {}).get("status") != "done"
+        ]
+        runnable = (
+            status == "active"
+            or (status in {"ready", "review"} and not unresolved)
+        )
+        if not runnable:
             continue
-        live_task_count += 1
+        runnable_count += 1
         owner = str(task.get("owner") or "").strip().lower()
         if owner in scores:
             scores[owner] += 100
         if status == "review":
             scores["reviewer"] += 50
-        elif status == "blocked":
-            scores["debugger"] += 50
-        elif status == "active":
-            scores["tester"] += 10
 
     ranked = sorted(DEFAULT_PRIORITY, key=lambda role: (-scores[role], DEFAULT_PRIORITY.index(role)))
     if requested:
         count = requested
         basis = "user_requested_count"
-    elif live_task_count:
-        count = min(max(2, live_task_count), len(DEFAULT_ROLES))
-        basis = "current_task_board"
+    elif runnable_count:
+        count = min(max(1, runnable_count), len(DEFAULT_ROLES))
+        basis = "current_runnable_frontier"
     else:
-        count = 3
-        basis = "default_balanced_team"
+        count = 0
+        basis = "main_only_no_runnable_work"
 
     return {
         "ok": True,

@@ -182,6 +182,50 @@ Agent still decides dispatch; the runtime may apply bounded elastic add/remove r
 while refusing scale-in for a worker with a live task lease, open/ready superstep, or generating
 browser tab.
 
+## Filesystem MVCC lanes and hard resource isolation
+
+The task/graph registry coordinates *what* should run; MVCC lanes enforce *where filesystem side
+effects may occur*. Repository-changing work must first own the task lease, then create a lane with
+hierarchical resource claims. The lane is a private source copy with an immutable base manifest.
+
+```text
+canonical workspace (canonical_id, epoch)
+        |
+        +--> Run A / Lane A ---- pending files, reads, scratch, experiments
+        |
+        +--> Run B / Lane B ---- independent private copy
+                              |
+                              v
+                     commit validation
+                     base + read-set + write-set
+                              |
+                    +---------+---------+
+                    |                   |
+                 commit              conflict
+                    |                   |
+             publish claimed       preserve lane;
+             write paths only      fork/rebase
+```
+
+Resource claims are canonical-workspace-scoped and hierarchical. `src/autol` overlaps every child
+path. Modes are `read`, `write`, and `scratch`: scratch permits private experiment/build output
+but is excluded from publication. Namespaced non-path resources (for example
+`experiment:drc/17net`) provide the same lease/conflict mechanism for expensive logical work.
+
+CodexPro's mutation/command entry points classify each workspace as canonical, lane, or unmanaged.
+A protected canonical workspace rejects managed mutation/commands; a lane accepts mutations only
+while active, and final commit rejects any delta outside its write/scratch claims. File reads form a
+precise read set; broad search/tree/inspect/commands conservatively mark an opaque read and therefore
+validate the full base manifest. Each successful write publication advances a per-canonical epoch and
+per-resource version; a global epoch remains only as an event sequence.
+
+Filesystem publication is journaled. Pre-image backups and a journal are durable before the registry
+enters `committing`. A process restart treats a still-`committing` transaction as aborted and rolls
+canonical back. If recovery material is unavailable, the lane/commit becomes `recovery_required`
+and managed canonical reads/writes remain blocked. Coordination checkpoints deliberately do not
+rewind lanes or published filesystem state; checkpoint restore is refused while a live/recovery lane
+exists.
+
 ## Durable interrupt/resume and checkpoint recovery
 
 WAS adopts LangGraph-style persistence semantics at the coordination layer without embedding a

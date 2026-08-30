@@ -11,6 +11,14 @@ from typing import Dict, List, Optional
 
 from .graph import compile_graph, graph_validate, normalize_edge, normalize_node
 
+ASSIST_KINDS = {
+    "readonly_analysis": {"owner": "researcher", "write_policy": "readonly"},
+    "verification": {"owner": "tester", "write_policy": "experiment_only"},
+    "disjoint_write": {"owner": "implementer", "write_policy": "disjoint_write"},
+    "proposal_only": {"owner": "reviewer", "write_policy": "proposal_only"},
+}
+ASSIST_WRITE_POLICIES = {"readonly", "experiment_only", "disjoint_write", "proposal_only"}
+
 
 def default_state_dir() -> Path:
     configured = os.environ.get("WEB_SWARM_STATE_DIR")
@@ -62,7 +70,7 @@ class DurableStore:
 
     def _empty(self) -> Dict[str, object]:
         return {
-            "schema_version": 7,
+            "schema_version": 8,
             "bindings": {},
             "tasks": {},
             "shared_status": {},
@@ -71,6 +79,13 @@ class DurableStore:
             "checkpoints": {},
             "graphs": {},
             "active_graph_id": "",
+            "runs": {},
+            "lanes": {},
+            "resource_claims": {},
+            "resource_versions": {},
+            "commits": {},
+            "canonical_epoch": 0,
+            "canonical_epochs": {},
         }
 
     def load(self) -> Dict[str, object]:
@@ -107,6 +122,11 @@ class DurableStore:
                 task.setdefault("last_error", "")
                 task.setdefault("retry_after", 0.0)
                 task.setdefault("interrupt_id", "")
+                task.setdefault("assist_parent_task_id", "")
+                task.setdefault("assist_kind", "")
+                task.setdefault("assist_write_policy", "")
+                task.setdefault("resource_hints", [])
+                task.setdefault("canonical_root", "")
         for graph_id, graph in list(base["graphs"].items()):
             if not isinstance(graph, dict):
                 base["graphs"].pop(graph_id, None)
@@ -162,6 +182,11 @@ class DurableStore:
         group_index: int = -1,
         parent_task_id: str = "",
         max_attempts: int = 3,
+        assist_parent_task_id: str = "",
+        assist_kind: str = "",
+        assist_write_policy: str = "",
+        resource_hints: Optional[List[object]] = None,
+        canonical_root: str = "",
     ) -> Dict[str, object]:
         clean_title = str(title or "").strip()
         if not clean_title:
@@ -185,6 +210,15 @@ class DurableStore:
             if clean_parent and clean_parent not in data["tasks"]:
                 raise ValueError("unknown parent_task_id")
             attempts_limit = max(1, int(max_attempts or 1))
+            clean_assist_parent = str(assist_parent_task_id or "").strip()
+            if clean_assist_parent and clean_assist_parent not in data["tasks"]:
+                raise ValueError("unknown assist_parent_task_id")
+            clean_assist_kind = str(assist_kind or "").strip().lower()
+            if clean_assist_kind and clean_assist_kind not in ASSIST_KINDS:
+                raise ValueError("unknown assist_kind: {0}".format(clean_assist_kind))
+            clean_write_policy = str(assist_write_policy or "").strip().lower()
+            if clean_write_policy and clean_write_policy not in ASSIST_WRITE_POLICIES:
+                raise ValueError("unknown assist_write_policy: {0}".format(clean_write_policy))
             task = {
                 "task_id": active_id,
                 "title": clean_title,
@@ -206,11 +240,123 @@ class DurableStore:
                 "last_error": "",
                 "retry_after": 0.0,
                 "interrupt_id": "",
+                "assist_parent_task_id": clean_assist_parent,
+                "assist_kind": clean_assist_kind,
+                "assist_write_policy": clean_write_policy,
+                "resource_hints": list(resource_hints or []),
+                "canonical_root": str(canonical_root or "").strip(),
                 "updated_at": time.time(),
             }
             data["tasks"][active_id] = task
             self.save(data)
             return dict(task)
+
+    def task_assist(
+        self,
+        parent_task_id: str,
+        title: str,
+        description: str = "",
+        owner: str = "",
+        assist_kind: str = "readonly_analysis",
+        write_policy: str = "",
+        resource_hints: Optional[List[object]] = None,
+        canonical_root: str = "",
+        payload: object = None,
+        max_attempts: int = 2,
+    ) -> Dict[str, object]:
+        """Create a parallel sidecar task for an already-runnable primary task."""
+        clean_parent = str(parent_task_id or "").strip()
+        clean_kind = str(assist_kind or "readonly_analysis").strip().lower()
+        if clean_kind not in ASSIST_KINDS:
+            raise ValueError("unknown assist_kind: {0}".format(clean_kind))
+        defaults = ASSIST_KINDS[clean_kind]
+        clean_owner = str(owner or defaults["owner"]).strip().lower()
+        clean_policy = str(write_policy or defaults["write_policy"]).strip().lower()
+        if clean_policy not in ASSIST_WRITE_POLICIES:
+            raise ValueError("unknown assist_write_policy: {0}".format(clean_policy))
+        clean_title = str(title or "").strip()
+        if not clean_title:
+            raise ValueError("title is required")
+
+        with self._write_lock():
+            data = self.load()
+            parent = data["tasks"].get(clean_parent)
+            if not isinstance(parent, dict):
+                raise KeyError("unknown parent_task_id")
+            parent_status = str(parent.get("status") or "")
+            if parent_status not in {"ready", "active", "review"}:
+                raise RuntimeError(
+                    "assist parent must be runnable/active, not {0}".format(parent_status)
+                )
+            unresolved = [
+                str(dep)
+                for dep in parent.get("dependencies", [])
+                if data["tasks"].get(str(dep), {}).get("status") != "done"
+            ]
+            if unresolved:
+                raise RuntimeError(
+                    "assist parent still has unresolved dependencies: {0}".format(
+                        ", ".join(unresolved)
+                    )
+                )
+            active_id = "assist_" + uuid.uuid4().hex[:10]
+            task = {
+                "task_id": active_id,
+                "title": clean_title,
+                "description": str(description or "").strip(),
+                "owner": clean_owner,
+                "dependencies": [],
+                "payload": payload,
+                "group_id": "",
+                "group_index": -1,
+                "parent_task_id": clean_parent,
+                "assist_parent_task_id": clean_parent,
+                "assist_kind": clean_kind,
+                "assist_write_policy": clean_policy,
+                "resource_hints": list(resource_hints or []),
+                "canonical_root": str(canonical_root or "").strip(),
+                "status": "ready",
+                "summary": "",
+                "result": None,
+                "superstep_id": "",
+                "claimed_by": "",
+                "lease_expires_at": 0.0,
+                "attempts": 0,
+                "max_attempts": max(1, int(max_attempts or 1)),
+                "last_error": "",
+                "retry_after": 0.0,
+                "interrupt_id": "",
+                "updated_at": time.time(),
+            }
+            data["tasks"][active_id] = task
+            self.save(data)
+            return dict(task)
+
+    def task_assists(
+        self,
+        parent_task_id: str,
+        include_terminal: bool = True,
+    ) -> List[Dict[str, object]]:
+        """List sidecar tasks attached to one primary task."""
+        clean_parent = str(parent_task_id or "").strip()
+        result = []
+        for task in self.load()["tasks"].values():
+            if not isinstance(task, dict):
+                continue
+            if str(task.get("assist_parent_task_id") or "") != clean_parent:
+                continue
+            if not include_terminal and str(task.get("status") or "") in {
+                "done", "failed", "cancelled"
+            }:
+                continue
+            result.append(dict(task))
+        return sorted(
+            result,
+            key=lambda item: (
+                float(item.get("updated_at") or 0.0),
+                str(item.get("task_id") or ""),
+            ),
+        )
 
     def task_claim(
         self,
@@ -237,6 +383,22 @@ class DurableStore:
             if not isinstance(task, dict):
                 raise KeyError("unknown task_id")
             now = time.time()
+            live_lanes = [
+                lane
+                for lane in data["lanes"].values()
+                if isinstance(lane, dict)
+                and str(lane.get("task_id") or "") == str(task_id)
+                and lane.get("status") in {"creating", "active", "committing", "recovery_required"}
+            ]
+            for lane in live_lanes:
+                lane_worker = str(lane.get("worker_name") or "")
+                if lane_worker and lane_worker != clean_worker:
+                    raise RuntimeError(
+                        "task has a live MVCC lane owned by {0}: {1}".format(
+                            lane_worker,
+                            str(lane.get("lane_id") or ""),
+                        )
+                    )
             unresolved = [
                 dep
                 for dep in task.get("dependencies", [])
@@ -348,8 +510,26 @@ class DurableStore:
             if str(task.get("status") or "") != "active":
                 raise RuntimeError("task is not active")
             now = time.time()
-            task["lease_expires_at"] = now + max(1, int(lease_seconds or 1))
+            new_expiry = now + max(1, int(lease_seconds or 1))
+            task["lease_expires_at"] = new_expiry
             task["updated_at"] = now
+            for lane in data["lanes"].values():
+                if (
+                    isinstance(lane, dict)
+                    and str(lane.get("task_id") or "") == str(task_id)
+                    and str(lane.get("worker_name") or "") == clean_worker
+                    and lane.get("status") in {"creating", "active", "committing", "recovery_required"}
+                ):
+                    run_id = str(lane.get("run_id") or "")
+                    lane["updated_at"] = now
+                    for claim in data["resource_claims"].values():
+                        if (
+                            isinstance(claim, dict)
+                            and str(claim.get("run_id") or "") == run_id
+                            and claim.get("status") == "active"
+                        ):
+                            claim["lease_expires_at"] = new_expiry
+                            claim["updated_at"] = now
             self.save(data)
             return dict(task)
 
@@ -375,6 +555,20 @@ class DurableStore:
                 raise KeyError("unknown task_id")
             if str(task.get("claimed_by") or "") != clean_worker:
                 raise RuntimeError("task is not leased by this worker")
+            live_lanes = [
+                str(lane.get("lane_id") or "")
+                for lane in data["lanes"].values()
+                if isinstance(lane, dict)
+                and str(lane.get("task_id") or "") == str(task_id)
+                and str(lane.get("worker_name") or "") == clean_worker
+                and lane.get("status") in {"creating", "active", "committing", "recovery_required"}
+            ]
+            if live_lanes:
+                raise RuntimeError(
+                    "task has live MVCC lane(s); commit/abort them before releasing the task lease: {0}".format(
+                        ",".join(live_lanes)
+                    )
+                )
             active_step_id = str(task.get("superstep_id") or "")
             if active_step_id:
                 active_step = data["supersteps"].get(active_step_id)
@@ -1713,11 +1907,19 @@ class DurableStore:
                 for step in data["supersteps"].values()
                 if isinstance(step, dict) and step.get("status") in {"open", "ready"}
             ]
-            if active_leases or active_steps:
+            live_lanes = [
+                str(lane.get("lane_id") or "")
+                for lane in data["lanes"].values()
+                if isinstance(lane, dict)
+                and lane.get("status") in {"creating", "active", "committing", "recovery_required"}
+            ]
+            if active_leases or active_steps or live_lanes:
                 raise RuntimeError(
-                    "cannot restore while active leases/supersteps exist: leases={0}, supersteps={1}".format(
+                    "cannot restore while active leases/supersteps/MVCC lanes exist: "
+                    "leases={0}, supersteps={1}, lanes={2}".format(
                         ",".join(active_leases) or "none",
                         ",".join(active_steps) or "none",
+                        ",".join(live_lanes) or "none",
                     )
                 )
             record = data["checkpoints"].get(clean_id)

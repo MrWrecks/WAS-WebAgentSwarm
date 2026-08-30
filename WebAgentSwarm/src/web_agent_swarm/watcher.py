@@ -13,7 +13,10 @@ TICK = (
     "[WEB_SWARM_TICK] Shared durable state changed. "
     "Call web_agent_swarm_snapshot and web_agent_swarm_coordination_plan. If an active "
     "SwarmGraph exists, obey its explicit wait_graph/graph_unselected routes and use revision-safe "
-    "swarm_graph_* mutations. Treat task state as graph routing: respect dependencies, retry waits, active leases, durable human "
+    "swarm_graph_* mutations. For repository-changing tasks, require an MVCC lane: claim hierarchical "
+    "resources, mutate only the returned lane workspace, heartbeat long lanes, and call swarm_lane_commit "
+    "before releasing the task. Treat commit conflict as a durable branch/fork event; never overwrite canonical. "
+    "Treat task state as graph routing: respect dependencies, retry waits, active leases, durable human "
     "interrupts, and blocked work. Resume open human-input waits through swarm_interrupt_resume "
     "only when input exists; do not infer it from chat memory. For divisible work, use Send-style "
     "swarm_task_fanout shards and swarm_task_reduce. If an open/ready superstep exists, never "
@@ -71,6 +74,10 @@ def _digest(snapshot: dict) -> str:
         "supersteps": snapshot.get("supersteps", []),
         "interrupts": snapshot.get("interrupts", []),
         "active_graph": snapshot.get("active_graph", {}),
+        "lanes": snapshot.get("lanes", []),
+        "resource_claims": snapshot.get("resource_claims", []),
+        "commits": snapshot.get("commits", []),
+        "canonical_epoch": snapshot.get("canonical_epoch", 0),
         "transport_alerts": _transport_alerts(snapshot),
     }
     raw = json.dumps(
@@ -108,6 +115,26 @@ def _has_unresolved_work(snapshot: dict) -> bool:
 
     for interrupt in snapshot.get("interrupts", []):
         if isinstance(interrupt, dict) and interrupt.get("status") == "open":
+            return True
+
+    for lane in snapshot.get("lanes", []):
+        if not isinstance(lane, dict):
+            continue
+        if lane.get("status") in {
+            "creating",
+            "active",
+            "committing",
+            "conflict",
+            "recovery_required",
+        }:
+            return True
+
+    for commit in snapshot.get("commits", []):
+        if isinstance(commit, dict) and commit.get("status") in {
+            "conflict",
+            "failed",
+            "recovery_required",
+        }:
             return True
 
     for agent in snapshot.get("agents", []):

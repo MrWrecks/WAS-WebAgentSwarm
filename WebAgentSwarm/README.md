@@ -190,6 +190,39 @@ web-agent-swarm scale --instances implementer=6
 The second command treats the count as a target total, so it adds only the missing
 `implementer-5` / `implementer-6` instances and preserves the existing workers.
 
+### MVCC development lanes
+
+Repository-changing work uses an isolated filesystem transaction instead of shared-workspace convention:
+
+```text
+task claim
+    -> swarm_lane_start(canonical_root, hierarchical resources)
+    -> private lane workspace
+    -> CodexPro read/write/test only in that lane
+    -> swarm_lane_commit
+       -> validate base/read/write hashes
+       -> publish all claimed write paths or return conflict
+    -> task release
+```
+
+Claims are scoped by canonical workspace and are hierarchical, so a write claim on `src/autol`
+conflicts with another write/read claim below that subtree. Each lane stores a complete base manifest,
+precise reads when available, conservative opaque-read state for broad search/commands, and a derived
+write set. `scratch` path claims permit experiment/build outputs inside the private lane but never
+publish those paths to canonical. Logical resources such as `experiment:drc/17net` can be claimed
+to prevent duplicate expensive work even when no source path is involved.
+
+The bundled CodexPro runtime hard-blocks canonical `write/edit/apply_patch/bash/background` while
+a live lane protects that workspace; lane mutations outside hierarchical write/scratch claims fail
+closed at commit. Successful publication advances per-canonical resource versions/epochs. If a base
+or observed read changed, commit records `conflict`, preserves the lane, and never overwrites
+canonical; `swarm_lane_fork` creates a new lane from the latest canonical state.
+
+Before touching canonical, commit creates pre-image backups plus a durable recovery journal. If the
+process dies with the durable commit still in `committing`, the next LaneManager startup (or
+`swarm_lane_recover`) rolls canonical back to the pre-commit state. Missing/invalid recovery
+material becomes `recovery_required` and keeps managed canonical access fail-closed.
+
 ### Durable interrupts and checkpoints
 
 WAS now mirrors two additional LangGraph execution ideas without taking a LangGraph runtime

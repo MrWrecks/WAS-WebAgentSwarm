@@ -16,6 +16,9 @@ import uuid
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from .mvcc import LaneManager
+from .state import DurableStore
+
 
 BLOCKED = {
     ".git", "node_modules", ".env", ".ssh", "dist", "build",
@@ -38,13 +41,21 @@ ACTIONS = [
 
 
 class CodexProLiteRuntime:
-    def __init__(self, default_root: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        default_root: Optional[str] = None,
+        state_root: Optional[str] = None,
+    ) -> None:
         self.default_root = Path(
             default_root or os.environ.get("CODEXPRO_ROOT") or os.getcwd()
         ).expanduser().resolve()
         self.workspaces: Dict[str, Path] = {}
         self.current_workspace_id: Optional[str] = None
         self.background: Dict[str, Dict[str, object]] = {}
+        self.durable_store = DurableStore(
+            Path(state_root).expanduser().resolve() if state_root else None
+        )
+        self.lanes = LaneManager(self.durable_store)
 
     @staticmethod
     def _wid(root: Path) -> str:
@@ -112,6 +123,11 @@ class CodexProLiteRuntime:
             "blockedParts": sorted(BLOCKED),
             "safeCommands": sorted(SAFE_COMMANDS),
             "authEnabled": False,
+            "mvccLaneGuard": True,
+            "mvccSemantics": (
+                "active canonical workspaces are mutation-blocked; lane workspaces "
+                "record reads and publish only through swarm_lane_commit"
+            ),
         }
 
     def open_current_workspace(
@@ -165,6 +181,7 @@ class CodexProLiteRuntime:
         **kwargs,
     ):
         root = self._root(workspace_id)
+        self.lanes.record_opaque_read(root, command="tree")
         base = self._path(workspace_id, path, True)
         lines = [str(base.relative_to(root)) if base != root else "."]
         count = 0
@@ -220,6 +237,7 @@ class CodexProLiteRuntime:
         **kwargs,
     ):
         root = self._root(workspace_id)
+        self.lanes.record_opaque_read(root, command="inspect_workspace")
         base = self._path(workspace_id, path, True)
         candidates = [base] if base.is_file() else base.rglob("*")
         files = []
@@ -264,6 +282,7 @@ class CodexProLiteRuntime:
         **kwargs,
     ):
         root = self._root(workspace_id)
+        self.lanes.record_opaque_read(root, command="search")
         base = self._path(workspace_id, path, True)
         pattern = re.compile(query) if regex else None
         candidates = [base] if base.is_file() else base.rglob("*")
@@ -306,6 +325,8 @@ class CodexProLiteRuntime:
         max_bytes: int = 300000,
         **kwargs,
     ):
+        root = self._root(workspace_id)
+        self.lanes.guard_read(root, path)
         target = self._path(workspace_id, path, True)
         if not target.is_file():
             raise ValueError("path is not a file")
@@ -334,6 +355,8 @@ class CodexProLiteRuntime:
         overwrite: bool = True,
         **kwargs,
     ):
+        root = self._root(workspace_id)
+        self.lanes.guard_mutation(root, path, operation="write")
         target = self._path(workspace_id, path)
         if target.exists() and not overwrite:
             raise FileExistsError(path)
@@ -358,6 +381,9 @@ class CodexProLiteRuntime:
         expected_replacements: int = 0,
         **kwargs,
     ):
+        root = self._root(workspace_id)
+        self.lanes.guard_read(root, path)
+        self.lanes.guard_mutation(root, path, operation="edit")
         target = self._path(workspace_id, path, True)
         text = target.read_text(encoding="utf-8")
         count = text.count(old_text)
@@ -376,8 +402,10 @@ class CodexProLiteRuntime:
 
     def apply_patch(self, patch: str, workspace_id: str = "", **kwargs):
         root = self._root(workspace_id)
+        self.lanes.guard_mutation(root, "", operation="apply_patch")
         if not shutil.which("git"):
             return {"ok": False, "error": "git is required for apply_patch"}
+        patch_paths = []
         for line in patch.splitlines():
             if line.startswith("--- ") or line.startswith("+++ "):
                 candidate = line[4:].strip().split("\t", 1)[0]
@@ -388,6 +416,11 @@ class CodexProLiteRuntime:
                 p = Path(candidate)
                 if p.is_absolute() or ".." in p.parts or self._blocked(p):
                     return {"ok": False, "error": "unsafe patch path"}
+                normalized = str(p).replace("\\", "/")
+                if normalized not in patch_paths:
+                    patch_paths.append(normalized)
+        for candidate in patch_paths:
+            self.lanes.guard_mutation(root, candidate, operation="apply_patch")
         with tempfile.NamedTemporaryFile(
             "w", suffix=".patch", delete=False, encoding="utf-8"
         ) as handle:
@@ -442,6 +475,9 @@ class CodexProLiteRuntime:
         timeout_ms: int = 30000,
         **kwargs,
     ):
+        root = self._root(workspace_id)
+        self.lanes.guard_mutation(root, "", operation="bash")
+        self.lanes.record_opaque_read(root, command=command)
         started = time.time()
         result = subprocess.run(
             self._argv(command),
@@ -469,6 +505,8 @@ class CodexProLiteRuntime:
         **kwargs,
     ):
         root = self._root(workspace_id)
+        self.lanes.guard_mutation(root, "", operation="run_background")
+        self.lanes.record_opaque_read(root, command=command)
         runtime_dir = root / ".ai-bridge" / "background"
         runtime_dir.mkdir(parents=True, exist_ok=True)
         task_id = uuid.uuid4().hex
@@ -540,6 +578,7 @@ class CodexProLiteRuntime:
         **kwargs,
     ):
         root = self._root(workspace_id)
+        self.lanes.record_opaque_read(root, command="show_changes")
         status = self._git(root, ["status", "--short"])
         if status is None or status.returncode:
             return {"changed": False, "status": "git unavailable"}
@@ -687,6 +726,7 @@ class CodexProLiteRuntime:
         **kwargs,
     ):
         root = self._root(workspace_id)
+        self.lanes.record_opaque_read(root, command="export_pro_context")
         selected = list(selected_paths or [])
         if include_important_files:
             for name in [
