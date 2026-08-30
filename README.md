@@ -1,970 +1,1011 @@
-# WAS — Web Agent Swarm
+# WebAgentSwarm
 
-**Web Agent Swarm (WAS)** is a local-first multi-agent orchestration system for ChatGPT Web.
+**WebAgentSwarm (WAS)** is a local-first orchestration runtime for coordinating multiple **ChatGPT Web agents** as a durable, elastic software-development swarm.
 
-It turns multiple ordinary ChatGPT browser tabs into a coordinated agent swarm with:
+Unlike conventional multi-agent frameworks where multiple agents run inside one Python process, WAS coordinates **multiple independent browser conversations**. Each browser tab is a real ChatGPT Web agent with its own context, while coordination truth lives in a shared durable runtime.
 
-- one Main Orchestrator;
-- multiple specialized Worker agents;
-- durable task state outside chat history;
-- dependency-aware scheduling;
-- dynamic worker scale-out;
-- exact browser-tab targeting;
-- event-aware wakeups;
-- a bundled CodexPro-compatible local development MCP.
+The core design goal is simple:
 
-WAS does not require a custom ChatGPT frontend.  
-Agents run directly inside normal ChatGPT Web tabs in your existing browser session.
+> Multiple Web agents should be able to work in parallel without relying on chat memory, manual coordination, Git branches, or “agents behaving nicely.”
 
 ---
 
-## Key idea
+## Why WebAgentSwarm?
+
+Most agent frameworks assume something like:
 
 ```text
-                 ┌─────────────────────┐
-                 │   Main Web Agent    │
-                 │    Orchestrator     │
-                 └──────────┬──────────┘
-                            │
-                durable coordination state
-                            │
-        ┌───────────────────┼───────────────────┐
-        ▼                   ▼                   ▼
-  ┌────────────┐      ┌────────────┐      ┌────────────┐
-  │ Worker A   │      │ Worker B   │      │ Worker C   │
-  │ researcher │      │ implementer│      │ tester     │
-  └────────────┘      └────────────┘      └────────────┘
-        │                   │                   │
-        └───────────────────┼───────────────────┘
-                            │
-                  Web Agent Swarm MCP
-                            │
-                  localhost browser bridge
-                            │
-                    browser extension
-                            │
-             currently connected browser profile
-                            │
-                     ChatGPT Web tabs
+Python Runtime
+├── Agent A
+├── Agent B
+├── Agent C
+└── Shared State
 ```
 
-Each worker is an ordinary ChatGPT conversation.
+WAS instead targets:
 
-The durable task graph, rather than chat memory, is the coordination truth.
+```text
+Browser
+├── ChatGPT Web Agent — Main
+├── ChatGPT Web Agent — Implementer
+├── ChatGPT Web Agent — Tester
+├── ChatGPT Web Agent — Reviewer
+└── ...
+          │
+          ▼
+   Durable Swarm Runtime
+```
+
+Every Web agent is an independent conversation.
+
+They coordinate through durable tasks, leases, graphs, checkpoints, resource claims, and isolated development lanes instead of relying on one conversation forwarding natural-language messages between workers.
 
 ---
 
-# Features
-
-## Browser-hosted multi-agent swarm
-
-WAS can create and coordinate multiple ChatGPT Web conversations as independent agents.
-
-A swarm can contain:
+# Architecture
 
 ```text
-Main Orchestrator
-├── researcher
+                    User
+                     │
+                     ▼
+             Main Web Agent
+                     │
+                     ▼
+              Durable SwarmGraph
+                     │
+          ┌──────────┼──────────┐
+          ▼          ▼          ▼
+       Task A      Task B      Task C
+          │          │          │
+          ▼          ▼          ▼
+      Worker A    Worker B    Worker C
+      Web Tab     Web Tab     Web Tab
+          │          │          │
+          └──────────┼──────────┘
+                     ▼
+              Durable Registry
+                     │
+                     ▼
+        Resource Claims + MVCC Lanes
+                     │
+                     ▼
+             Canonical Workspace
+```
+
+WAS separates two layers:
+
+### Logical execution layer
+
+```text
+SwarmGraph
+Tasks
+Dependencies
+Conditional edges
+Interrupts
+Checkpoints
+Supersteps
+```
+
+### Physical execution layer
+
+```text
+ChatGPT Web tabs
+Worker roles
+Worker instances
+Browser bindings
+Elastic scale-out / scale-in
+```
+
+This means logical workflow topology does not depend on how many browser agents happen to be active.
+
+---
+
+# Durable Coordination
+
+WAS does **not** use browser conversation history as cluster truth.
+
+The runtime maintains durable structured state including:
+
+```text
+tasks
+bindings
+shared_status
+supersteps
+interrupts
+checkpoints
+graphs
+runs
+lanes
+resource_claims
+resource_versions
+commits
+```
+
+A worker must atomically claim a task before executing it.
+
+```text
+ready
+  │
+  ▼
+task_claim
+  │
+  ├── claimed_by
+  ├── lease_expires_at
+  └── attempts
+```
+
+Only one worker can hold a valid task lease at a time.
+
+If a worker disappears, the lease can expire and the work becomes recoverable.
+
+---
+
+# Explicit Durable SwarmGraph
+
+WAS includes an explicit mutable workflow graph inspired by LangGraph-style execution semantics.
+
+```text
+SwarmGraph
+├── task nodes
+├── router nodes
+├── control nodes
+├── join nodes
+├── agent nodes
+├── tool nodes
+│
+├── dependency edges
+└── conditional edges
+```
+
+Example:
+
+```text
+                    Research
+                       │
+              ┌────────┴────────┐
+              ▼                 ▼
+        Implement A        Implement B
+              │                 │
+              └────────┬────────┘
+                       ▼
+                     Test
+                       │
+                       ▼
+                    Review
+```
+
+Conditional routing is durable and declarative.
+
+Example condition:
+
+```json
+{
+  "source": "task_result",
+  "path": "route",
+  "op": "eq",
+  "value": "fast"
+}
+```
+
+A conditional branch can become:
+
+```text
+dispatch
+wait_graph
+graph_unselected
+```
+
+Graph routing is not merely advisory.
+
+The atomic task-claim layer checks the active SwarmGraph, so a worker cannot manually claim a task that is blocked by graph state.
+
+Graph mutations also support optimistic revision control:
+
+```text
+Graph revision = 12
+
+Agent A updates revision 12
+→ revision 13
+
+Agent B still writes expected_revision=12
+→ REVISION CONFLICT
+```
+
+No silent topology overwrite.
+
+---
+
+# Elastic Web-Agent Pool
+
+WAS can start with only the Main agent.
+
+```text
+Main
+```
+
+The Main agent reads durable runnable pressure and decides how many workers are actually needed.
+
+Example:
+
+```text
+Runnable work:
+implementer = 3
+tester      = 1
+reviewer    = 0
+```
+
+Possible runtime topology:
+
+```text
+Main
 ├── implementer
-├── tester
-├── reviewer
-├── debugger
-└── documenter
+├── implementer-2
+├── implementer-3
+└── tester
 ```
 
-Multiple instances of the same role are also supported:
+When work finishes, excess workers can be suspended and browser tabs closed.
+
+Later demand can resume the preserved conversation before opening a new worker.
+
+WAS includes:
+
+* global worker budget
+* role pressure
+* multiple instances of the same role
+* lease-aware scale-in
+* superstep-aware scale-in
+* generating-tab protection
+* scale-in hysteresis
+* preserved browser bindings
+
+Browser idle is treated only as an availability signal.
+
+> Browser idle is never considered task completion truth.
+
+---
+
+# Send-Style Fan-Out and Reduce
+
+Parallel work can be dynamically sharded.
+
+```text
+Task
+ │
+ ▼
+fanout
+ ├── shard 0
+ ├── shard 1
+ ├── shard 2
+ └── shard 3
+        │
+        ▼
+ multiple worker instances
+        │
+        ▼
+      reduce
+```
+
+Workers of the same role can claim separate shards concurrently:
 
 ```text
 implementer
 implementer-2
 implementer-3
-tester
-tester-2
 ```
 
-The number of workers does not have to remain fixed after startup.
+Reducer output remains stable in shard order.
 
 ---
 
-## Dynamic scale-out
+# Durable Interrupt / Resume
 
-WAS can begin with a small swarm and add workers later when the durable task graph indicates more parallel capacity is useful.
-
-For example:
+Human input is represented as durable execution state rather than inferred from chat.
 
 ```text
-Initial swarm:
-
-Main
-├── implementer
-└── tester
-```
-
-Later:
-
-```text
-Main
-├── implementer
-├── implementer-2
-├── implementer-3
-├── tester
-└── reviewer
-```
-
-Scale-out is based on runnable task pressure, leases, blocked work, and role demand.
-
-A browser tab being idle is **not** by itself a reason to create another worker.
-
----
-
-## Durable task graph
-
-WAS keeps coordination state outside individual ChatGPT conversations.
-
-Tasks can contain:
-
-```text
-task_id
-status
-owner / role
-dependencies
-payload
-group_id
-claimed_by
-lease_expires_at
-attempts
-max_attempts
-retry_after
-result
-```
-
-Typical task states include:
-
-```text
-ready
-active
-blocked
-review
-done
-failed
-```
-
-This lets the Main Agent reason about the actual task graph rather than relying on conversational memory.
-
----
-
-## Task leases
-
-Before performing concrete work, a worker claims a task.
-
-```text
-ready
-  │
-  ▼
-claimed by implementer-2
-  │
-  ▼
-active lease
-  │
-  ├── heartbeat
-  │
-  ▼
-done / retry / failed
-```
-
-Leases reduce accidental duplicate work when multiple workers share the same role.
-
-Expired leases can return work to the runnable frontier.
-
----
-
-## Dependency-aware scheduling
-
-Tasks may depend on other tasks.
-
-```text
-Task A ──────┐
-             ├──► Task C
-Task B ──────┘
-```
-
-`Task C` remains behind a fan-in barrier until both prerequisites are complete.
-
-WAS derives routes such as:
-
-```text
-dispatch
-wait_dependencies
-wait_retry
-leased
-interrupt
-terminal
-```
-
----
-
-## Send-style fan-out and reducer
-
-Large divisible tasks can be split into independent shards.
-
-```text
-                 parent task
-                     │
-                     ▼
-             swarm_task_fanout
-          ┌──────────┼──────────┐
-          ▼          ▼          ▼
-       shard 0    shard 1    shard 2
-          │          │          │
-          ▼          ▼          ▼
- implementer implementer-2 implementer-3
-          │          │          │
-          └──────────┼──────────┘
-                     ▼
-             swarm_task_reduce
-                     │
-                     ▼
-               stable result
-```
-
-Each shard may carry a different payload.
-
-Reducer output preserves shard ordering.
-
----
-
-## Atomic supersteps
-
-For coordinated rounds where partial publication would be unsafe, WAS supports a superstep barrier.
-
-```text
-Main
+task
  │
- ├── swarm_superstep_begin
+ ▼
+interrupt_create
  │
- ├──── Worker A executes
+ ├── task = blocked
+ ├── interrupt = open
+ └── worker lease released
  │
- ├──── Worker B executes
+ ▼
+human input
  │
- └──── Worker C executes
-          │
-          ▼
-     staged writes
-          │
-          ▼
-   ready_to_commit
-          │
-          ▼
- swarm_superstep_commit
+ ▼
+interrupt_resume
+ │
+ ├── resume value persisted
+ └── task = ready
 ```
 
-If one participant fails, stale leases are detected, or conflicting writes appear, the round fails closed.
-
-The staged task/status outputs are not partially published.
+A restarted browser does not need to reconstruct the interrupt from chat history.
 
 ---
 
-# Current-browser-profile policy
+# Checkpoints and Time Travel
 
-WAS deliberately operates only inside the browser profile that is **currently connected to the local bridge through the WAS extension**.
+WAS can checkpoint coordination state before risky workflow changes.
 
-This is an important design rule.
-
-New Agent tabs are created by the browser extension using:
-
-```javascript
-chrome.tabs.create(...)
-```
-
-Therefore they remain inside the **same Edge/Chrome profile** where the extension is running and reuse that profile's existing ChatGPT login session.
-
-WAS does **not**:
+A checkpoint stores:
 
 ```text
-launch another Edge profile
-switch browser profiles
-use --profile-directory
-copy browser cookies
-copy login credentials
-create a separate browser session
+tasks
+shared_status
+supersteps
+interrupts
+SwarmGraphs
+active_graph_id
 ```
 
-If exactly one browser-profile extension is connected:
+Browser conversation bindings are intentionally not rewound.
 
 ```text
-extensionClients = 1
-→ browser operations allowed
+Logical coordination state
+        ≠
+Browser execution identity
 ```
 
-If no browser profile is connected:
-
-```text
-extensionClients = 0
-→ request rejected
-```
-
-If multiple profiles connect to the same bridge:
-
-```text
-extensionClients > 1
-→ HTTP 409
-→ WAS refuses to guess which profile is current
-```
-
-Use a separate bridge port for each browser profile if multiple independent profiles are required.
+Checkpoint restore fails closed while live task leases, active barriers, or live MVCC lanes exist.
 
 ---
 
-# Browser capabilities
+# Atomic Supersteps
 
-The bundled browser extension can:
-
-```text
-list ChatGPT tabs
-open a new ChatGPT tab
-inspect a specific tab
-detect idle / generating state
-read bounded recent visible messages
-send a message to an exact tab
-track stable ChatGPT conversation URLs
-```
-
-WAS binds agents using ChatGPT conversation IDs instead of ephemeral browser tab IDs.
-
-For example:
+For coordinated rounds where partial publication is unsafe, WAS supports Pregel-style pending writes.
 
 ```text
-https://chatgpt.com/c/<conversation-id>
+superstep_begin
+      │
+      ├── Worker A stages result
+      ├── Worker B stages result
+      └── Worker C stages result
+                │
+                ▼
+            Barrier ready
+                │
+                ▼
+         atomic superstep_commit
 ```
 
-Temporary ChatGPT URLs such as:
+If one participant fails:
 
 ```text
-/c/WEB:...
+superstep_fail
+      │
+      ▼
+entire round aborted
 ```
 
-are not treated as stable conversation identities.
+No partial durable publication.
 
 ---
 
-# Event-aware orchestration
+# MVCC Development Lanes
 
-WAS includes a deterministic watcher.
-
-The watcher observes changes in:
+One of the biggest problems in multi-agent coding systems is that coordination state can say:
 
 ```text
-worker UI state
-durable task state
-shared status
+Agent A owns module X
 ```
 
-When meaningful state changes, it wakes the Main Agent.
+while another agent can still physically modify the same file.
 
-The watcher itself does not decide which task should run.
+WAS addresses this with filesystem-level **MVCC development lanes**.
 
 ```text
-state changed
-     │
-     ▼
-   watcher
-     │
-     ▼
-wake Main
-     │
-     ▼
-Main re-reads durable coordination state
-     │
-     ▼
-dispatch / wait / scale / review
+Task Claim
+    │
+    ▼
+Hierarchical Resource Claim
+    │
+    ▼
+Private MVCC Lane
+    │
+    ▼
+Agent modifies private workspace
+    │
+    ▼
+Read / Write Validation
+    │
+    ├── PASS
+    │      ▼
+    │   Commit
+    │      ▼
+    │  Canonical Workspace
+    │
+    └── CONFLICT
+           ▼
+       Never overwrite
+```
+
+Each Run receives a private source copy.
+
+The agent works only inside that lane.
+
+---
+
+## Hierarchical Resource Claims
+
+Resources are hierarchical.
+
+```text
+claim: src/autol
+```
+
+conflicts with:
+
+```text
+src/autol/router.py
+src/autol/web_agent_swarm.py
+src/autol/submodule/foo.py
+```
+
+Resource claims are scoped to a canonical workspace, so identical paths in unrelated projects do not conflict.
+
+Logical resources are also supported.
+
+Example:
+
+```text
+experiment:calibre/17net
+benchmark:router/v3
+artifact:oa/view/foo
+```
+
+This can prevent two agents from independently launching the same expensive experiment.
+
+---
+
+# Write / Read / Scratch Claims
+
+Path resources support three modes.
+
+### `write`
+
+The lane may modify the resource and publish it to canonical during commit.
+
+### `read`
+
+The resource represents a dependency observed by the Run.
+
+If canonical changes before commit, the Run can fail validation.
+
+### `scratch`
+
+The lane may modify the path, but the result is never published.
+
+Useful for:
+
+```text
+build/
+tmp/
+scratch/
+experiment output
+generated logs
+temporary verifier artifacts
+```
+
+Example:
+
+```text
+src/router.py      → write
+config/router.yaml → read
+scratch/calibre/   → scratch
 ```
 
 ---
 
-# Bundled CodexPro Lite
+# Serializable-Style Read Validation
 
-WAS includes a clean-room CodexPro-compatible local development MCP server.
+Checking only modified files is not sufficient.
 
-It is designed for agents that need to perform concrete work on a local repository.
-
-Start it with:
-
-```bash
-python -m web_agent_swarm.codexpro_server
-```
-
-or:
-
-```bash
-web-agent-swarm-codexpro
-```
-
-CodexPro Lite includes core actions such as:
+Example:
 
 ```text
-server_config
-codexpro_self_test
-load_skill
+Agent A reads config.py
+Agent A modifies router.py
 
-open_current_workspace
-open_workspace
-inspect_workspace
+Agent B modifies config.py
+```
 
-tree
-search
-read
+Even though both agents modified different files, Agent A's result may now be stale.
 
+WAS therefore tracks:
+
+```text
+read_set
+write_set
+```
+
+Broad operations such as repository-wide search or arbitrary shell commands can be marked as:
+
+```text
+opaque_read = true
+```
+
+which conservatively validates the full base manifest before commit.
+
+This is similar in spirit to optimistic serializable validation.
+
+---
+
+# Canonical Versions and Epochs
+
+Each canonical workspace has its own identity and version sequence.
+
+```text
+canonical_id
+canonical_epoch
+resource_version
+```
+
+Example:
+
+```text
+src/router.py
+version = 18
+
+Agent lane saw:
+version = 17
+
+commit
+→ conflict
+```
+
+The old lane is preserved for provenance.
+
+It can then fork from the new canonical state:
+
+```text
+old lane
+   │
+   ▼
+conflict
+   │
+   ▼
+swarm_lane_fork
+   │
+   ▼
+new lane from latest canonical
+```
+
+---
+
+# Hard Canonical Guard
+
+The bundled CodexPro runtime recognizes:
+
+```text
+canonical workspace
+lane workspace
+unmanaged workspace
+```
+
+When a live MVCC lane protects a canonical workspace, managed mutation entry points are blocked.
+
+Examples:
+
+```text
 write
 edit
 apply_patch
-
 bash
-
-run_background
-background_status
-background_cancel
-
-show_changes
-
-read_handoff
-wait_for_handoff
-handoff_to_agent
-
-compact_context
-resume_context
-export_pro_context
+background execution
 ```
 
-It also exposes the supertool-style interface:
+must run inside the lane instead.
 
-```text
-codexpro(action, args)
-```
+Therefore the system does not rely only on:
+
+> "Agent, please remember not to edit the shared workspace."
+
+The restriction exists at the tool boundary.
+
+Final commit also re-derives the filesystem delta, so edits outside claimed paths fail closed.
 
 ---
 
-## CodexPro Lite security model
+# Crash-Safe Commit Journal
 
-The bundled implementation is intentionally constrained.
+Multi-file publication can fail in the middle of a process crash.
 
-It:
+WAS therefore creates:
 
 ```text
-keeps file operations inside the workspace
-blocks common secret/dependency/build directories
-uses an allowlist for verification commands
-rejects shell chaining and redirection
-does not bundle credentials
-does not bundle private endpoints
-does not bundle machine-specific allowed roots
+pre-image backups
++
+durable commit journal
 ```
 
-It is a clean-room compatible implementation, not a byte-for-byte copy of any private CodexPro deployment.
+before publishing canonical files.
+
+```text
+prepare backups
+      │
+      ▼
+write journal
+      │
+      ▼
+status = committing
+      │
+      ▼
+publish files
+      │
+      ▼
+durable commit
+```
+
+If the process dies while the durable state still says:
+
+```text
+committing
+```
+
+the next runtime startup automatically restores the canonical workspace to the pre-commit state.
+
+Manual recovery is also available through:
+
+```text
+swarm_lane_recover
+```
+
+If required recovery material is missing or invalid:
+
+```text
+recovery_required
+```
+
+is persisted and managed canonical access remains fail-closed.
 
 ---
 
-# Repository structure
+# Browser Bridge
 
-```text
-WebAgentSwarm/
-├── bridge/
-│   ├── server.js
-│   ├── package.json
-│   └── README.md
-│
-├── browser-extension/
-│   ├── manifest.json
-│   ├── background.js
-│   ├── content.js
-│   ├── options.html
-│   ├── options.js
-│   └── README.md
-│
-├── docs/
-│   ├── ARCHITECTURE.md
-│   ├── INSTALL.md
-│   └── PRIVACY.md
-│
-├── examples/
-│   ├── agent-prompts.md
-│   └── mcp-config.example.json
-│
-├── integrations/
-│   └── codexpro/
-│
-├── scripts/
-│   ├── setup.ps1
-│   ├── setup.sh
-│   ├── start-bridge.ps1
-│   ├── start-bridge.sh
-│   ├── start-watcher.ps1
-│   ├── start-watcher.sh
-│   ├── start-codexpro.ps1
-│   ├── start-codexpro.sh
-│   └── release_check.py
-│
-├── src/
-│   └── web_agent_swarm/
-│       ├── bridge.py
-│       ├── cli.py
-│       ├── state.py
-│       ├── roles.py
-│       ├── swarm.py
-│       ├── watcher.py
-│       ├── mcp_server.py
-│       ├── codexpro_core.py
-│       └── codexpro_server.py
-│
-├── tests/
-│   ├── test_bridge.py
-│   ├── test_roles.py
-│   ├── test_state.py
-│   ├── test_swarm.py
-│   └── test_codexpro_lite.py
-│
-├── AGENTS.md
-├── CONTRIBUTING.md
-├── SECURITY.md
-├── LICENSE
-├── pyproject.toml
-└── README.md
-```
+WAS communicates with currently connected ChatGPT Web tabs through a browser bridge.
+
+The bridge supports:
+
+* current browser profile reuse
+* stable browser bindings
+* targeted tab messaging
+* idempotent command IDs
+* close-tab
+* stuck-generation detection
+* retry-safe message delivery
+
+WAS does not intentionally launch arbitrary alternate browser profiles when an existing connected profile is available.
 
 ---
 
-# Requirements
+# Semantic Watcher
+
+The watcher does not blindly send periodic messages.
+
+It tracks meaningful durable changes such as:
 
 ```text
-Edge or Chrome
-Node.js 20+
-Python 3.10+
-A logged-in ChatGPT Web session
+task state
+SwarmGraph revision
+interrupt state
+superstep state
+MVCC lane state
+resource claims
+commit conflicts
+commit recovery
+transport faults
 ```
 
-An MCP-capable host is optional unless you want to expose WAS or CodexPro Lite through MCP.
+UI-only changes such as:
+
+```text
+idle
+generating
+message count
+```
+
+do not by themselves become coordination truth.
+
+The default semantic watcher interval is 300 seconds.
+
+---
+
+# Relationship to LangGraph
+
+WAS borrows several execution ideas associated with graph runtimes such as LangGraph:
+
+| Concept            | WAS                                 |
+| ------------------ | ----------------------------------- |
+| State graph        | `SwarmGraph`                        |
+| Conditional edge   | Structured graph conditions         |
+| Send               | `swarm_task_fanout`                 |
+| Reducer            | `swarm_task_reduce`                 |
+| Pregel superstep   | `swarm_superstep_*`                 |
+| Checkpoint         | `swarm_checkpoint_*`                |
+| Interrupt / resume | `swarm_interrupt_*`                 |
+| Fork / branch      | Graph and MVCC lane fork            |
+| Pending writes     | Superstep + lane pending changes    |
+| Version tracking   | Graph revisions + resource versions |
+
+However, WAS targets a different execution environment:
+
+> LangGraph usually controls nodes inside one runtime.
+> WAS coordinates multiple independent **ChatGPT Web conversations** that may execute filesystem operations, shell commands, browser actions, and external tools.
+
+For that reason WAS adds an additional filesystem transaction layer through MVCC lanes.
+
+---
+
+# Typical Workflow
+
+```text
+User starts WAS
+      │
+      ▼
+Main Web Agent
+      │
+      ▼
+Build / inspect durable task graph
+      │
+      ▼
+Elastic worker allocation
+      │
+      ▼
+Worker task claim
+      │
+      ▼
+MVCC lane + resource claims
+      │
+      ▼
+Worker modifies/tests private workspace
+      │
+      ▼
+MVCC validation
+      │
+      ├── conflict → preserve / fork
+      │
+      └── commit
+             │
+             ▼
+      canonical update
+             │
+             ▼
+        task release
+             │
+             ▼
+      downstream graph routing
+```
 
 ---
 
 # Installation
 
-## 1. Clone the repository
+Clone the repository and install locally:
 
 ```bash
-git clone https://github.com/yanchun2530/WAS-WebAgentSwarm.git
-cd WAS-WebAgentSwarm
+pip install -e .
+```
+
+Optional MCP support:
+
+```bash
+pip install -e ".[mcp]"
 ```
 
 ---
 
-## 2. Install the bridge
+# Run
+
+Start WAS with Main only:
 
 ```bash
-cd bridge
-npm install
-npm start
+web-agent-swarm start
 ```
 
-Default HTTP endpoint:
+WAS can then derive the worker topology from durable runnable pressure.
 
-```text
-http://127.0.0.1:8788
+Explicit roles are also supported:
+
+```bash
+web-agent-swarm start --roles implementer tester reviewer
 ```
 
-Default WebSocket endpoint:
+Multiple instances of one role:
 
-```text
-ws://127.0.0.1:8788/ws
+```bash
+web-agent-swarm scale --instances implementer=4 tester=2
 ```
 
-Check:
+Start the watcher:
 
-```text
-http://127.0.0.1:8788/health
+```bash
+web-agent-swarm-watch
+```
+
+Start the bundled CodexPro-compatible local development server:
+
+```bash
+web-agent-swarm-codexpro
 ```
 
 ---
 
-## 3. Install the browser extension
+# Core MCP Operations
 
-### Microsoft Edge
-
-Open:
+## Tasks
 
 ```text
-edge://extensions/
+swarm_task_create
+swarm_task_claim
+swarm_task_heartbeat
+swarm_task_release
+swarm_task_fanout
+swarm_task_reduce
 ```
 
-Then:
+## SwarmGraph
 
 ```text
-Enable Developer mode
-→ Load unpacked
-→ select browser-extension/
+swarm_graph_create
+swarm_graph_get
+swarm_graph_list
+swarm_graph_replace
+swarm_graph_preview
+swarm_graph_validate
+swarm_graph_activate
+swarm_graph_deactivate
+swarm_graph_node_add
+swarm_graph_node_update
+swarm_graph_node_remove
+swarm_graph_edge_add
+swarm_graph_edge_update
+swarm_graph_edge_remove
 ```
 
-### Google Chrome
-
-Open:
+## MVCC lanes
 
 ```text
-chrome://extensions/
+swarm_lane_start
+swarm_lane_get
+swarm_lane_list
+swarm_lane_heartbeat
+swarm_lane_commit
+swarm_lane_abort
+swarm_lane_fork
+swarm_lane_recover
+swarm_resource_claim
+swarm_resource_claim_list
+swarm_run_list
+swarm_commit_list
 ```
 
-Then use the same **Load unpacked** flow.
-
-The extension should connect to:
+## Interrupts
 
 ```text
-ws://127.0.0.1:8788/ws
+swarm_interrupt_create
+swarm_interrupt_resume
+swarm_interrupt_list
 ```
 
-The browser profile where you load the extension becomes the profile WAS controls.
-
----
-
-## 4. Install the Python runtime
-
-From the repository root:
-
-```bash
-python -m venv .venv
-```
-
-Activate the environment, then:
-
-```bash
-python -m pip install -e ".[mcp]"
-```
-
----
-
-# Smoke test
-
-Run:
-
-```bash
-web-agent-swarm health
-```
-
-Then:
-
-```bash
-web-agent-swarm tabs
-```
-
-A healthy bridge should report something similar to:
-
-```json
-{
-  "ok": true,
-  "extensionClients": 1
-}
-```
-
-`tabs` should show the ChatGPT tabs visible to the currently connected browser profile.
-
----
-
-# Plan a swarm
-
-WAS separates planning from browser mutation.
-
-```bash
-web-agent-swarm plan
-```
-
-or:
-
-```bash
-web-agent-swarm plan --workers 4
-```
-
-Example proposal:
+## Checkpoints
 
 ```text
-Main Orchestrator
-+
-implementer
-tester
-reviewer
-researcher
+swarm_checkpoint_create
+swarm_checkpoint_list
+swarm_checkpoint_restore
 ```
 
-The swarm should normally be started only after the user accepts the proposed role/count split.
-
----
-
-# Start a swarm
-
-Example:
-
-```bash
-web-agent-swarm start \
-  --roles implementer tester reviewer researcher
-```
-
-Example with multiple instances of one role:
-
-```bash
-web-agent-swarm start \
-  --roles implementer tester \
-  --instances implementer=4 tester=1
-```
-
-This produces:
+## Supersteps
 
 ```text
-Main
-├── implementer
-├── implementer-2
-├── implementer-3
-├── implementer-4
-└── tester
+swarm_superstep_begin
+swarm_superstep_stage
+swarm_superstep_fail
+swarm_superstep_commit
 ```
 
 ---
 
-# Scale an existing swarm
+# Safety Model
 
-Increase a role to a target total:
-
-```bash
-web-agent-swarm scale \
-  --instances implementer=6
-```
-
-If four implementers already exist, WAS adds only:
+WAS uses multiple layers rather than trusting one mechanism.
 
 ```text
-implementer-5
-implementer-6
+Task Lease
+    ↓
+prevents duplicate task ownership
+
+Resource Claim
+    ↓
+avoids obvious parallel conflicts
+
+Private MVCC Lane
+    ↓
+isolates filesystem side effects
+
+Read/Write Validation
+    ↓
+detects stale execution
+
+Canonical Tool Guard
+    ↓
+blocks managed direct mutation
+
+Commit Journal
+    ↓
+protects against partial publication
+
+Conflict/Fork
+    ↓
+never silently overwrites newer work
 ```
 
-Existing workers are preserved.
+Resource claims are primarily a coordination and efficiency mechanism.
+
+MVCC validation is the correctness boundary.
 
 ---
 
-# Create durable tasks
+# Verification
 
-Example:
-
-```bash
-web-agent-swarm task-create \
-  "Implement feature X" \
-  --owner implementer
-```
-
-Then:
-
-```bash
-web-agent-swarm task-create \
-  "Verify feature X" \
-  --owner tester
-```
-
-Workers should claim eligible tasks before concrete execution.
-
----
-
-# Watcher
-
-Swarm startup normally launches the watcher automatically.
-
-Manual mode:
-
-```bash
-web-agent-swarm watch \
-  --interval 15 \
-  --max-silence 300
-```
-
-The watcher wakes the Main Agent when coordination state changes.
-
-It does not independently make task-selection decisions.
-
----
-
-# MCP
-
-WAS exposes two MCP servers.
-
-## Web Agent Swarm MCP
-
-```bash
-python -m web_agent_swarm.mcp_server
-```
-
-This exposes browser-agent and swarm coordination tools.
-
----
-
-## CodexPro Lite MCP
-
-```bash
-python -m web_agent_swarm.codexpro_server
-```
-
-This exposes local repository development tools.
-
-Example MCP configuration is available at:
+Current release:
 
 ```text
-examples/mcp-config.example.json
+WebAgentSwarm v0.4.0
+```
+
+Regression suite:
+
+```text
+63 / 63 tests PASS
+```
+
+Covered scenarios include:
+
+* task lease exclusivity
+* graph routing
+* graph revision conflicts
+* conditional branch selection
+* elastic scaling
+* scale-in safety
+* durable interrupts
+* checkpoint restore
+* superstep atomicity
+* hierarchical resource conflicts
+* canonical direct-write blocking
+* lane out-of-scope mutation rejection
+* stale write conflict
+* stale read conflict
+* opaque-read validation
+* scratch non-publication
+* multi-canonical isolation
+* resource version tracking
+* conflict → fork
+* crash-interrupted commit rollback
+
+Release check:
+
+```text
+PASS
 ```
 
 ---
 
-# Privacy
+# Design Principle
 
-WAS is designed to remain local-first.
+WAS treats browser agents as unreliable distributed workers rather than trusted cooperating scripts.
 
-The project does not require storing:
+The runtime therefore follows one core rule:
 
-```text
-ChatGPT passwords
-browser cookies
-Microsoft/Google credentials
-full browser profiles
-private connector tokens
-full conversation transcripts
-```
+> Coordination intent should be durable, and correctness should be enforced below the prompt layer.
 
-The bridge binds to loopback by default:
-
-```text
-127.0.0.1
-```
-
-Only bounded visible ChatGPT UI state is inspected by the browser extension.
-
----
-
-# Safety boundaries
-
-WAS does not attempt to bypass:
-
-```text
-CAPTCHAs
-human verification
-anti-bot systems
-rate limits
-account permissions
-platform access controls
-```
-
-If ChatGPT requires user interaction, that remains a user-controlled browser action.
-
----
-
-# Completion semantics
-
-A browser page being idle means only:
-
-```text
-ChatGPT is currently not generating text
-```
-
-It does **not** prove that an external task succeeded.
-
-For example:
-
-```text
-build completed
-tests passed
-deployment succeeded
-experiment finished
-```
-
-must be verified using the real external source of truth.
-
-Durable task state and concrete verification evidence determine completion.
-
----
-
-# Development
-
-Run the Python regression suite:
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-Check Python syntax:
-
-```bash
-python -m compileall -q src tests
-```
-
-Check bridge JavaScript:
-
-```bash
-node --check bridge/server.js
-```
-
-Check extension JavaScript:
-
-```bash
-node --check browser-extension/background.js
-node --check browser-extension/content.js
-```
-
-Before publishing:
-
-```bash
-python scripts/release_check.py
-```
-
----
-
-# Design principles
-
-```text
-Browser profile is explicit.
-Durable state beats chat memory.
-Task leases prevent duplicate work.
-Browser idle is not completion.
-Scale from runnable work pressure.
-Fail closed on ambiguous browser profiles.
-Keep orchestration local and inspectable.
-Do not hide autonomous scheduling behind the browser UI.
-```
+That means an agent may misunderstand an instruction, retry incorrectly, or attempt to touch the wrong file — but the runtime should still prevent silent corruption of shared state.
 
 ---
 
 # License
 
-MIT License.
-
-See:
-
-```text
-LICENSE
-```
-
----
-
-## Status
-
-Web Agent Swarm currently includes:
-
-```text
-Browser extension               ✓
-Local HTTP/WebSocket bridge     ✓
-Exact ChatGPT tab targeting     ✓
-Current-profile-only control    ✓
-Stable conversation binding     ✓
-Main + Worker orchestration     ✓
-Multiple workers per role       ✓
-Dynamic scale-out               ✓
-Durable task graph              ✓
-Task leases / retries           ✓
-Fan-out / reducer               ✓
-Dependency barriers             ✓
-Atomic supersteps               ✓
-Event-aware watcher             ✓
-Web Agent Swarm MCP             ✓
-Bundled CodexPro Lite MCP       ✓
-Privacy/release checks          ✓
-```
-
-WAS is intended as a practical foundation for coordinating multiple browser-hosted AI agents while keeping browser identity, task state, and local development capabilities explicit and inspectable.
+MIT
