@@ -19,6 +19,12 @@ The browser extension is also the browser-profile boundary. All tab creation hap
 never launches Edge/Chrome with a profile selector. The bridge requires exactly one connected
 profile and fails closed if multiple profile-scoped extension clients are connected.
 
+WAS also protects Agent-tab lifecycle at this boundary. Observed/created ChatGPT tabs are marked
+`autoDiscardable=false`; discarded tabs are restored before inspect/send; and tab metadata exposes
+`discarded`, `frozen`, and `autoDiscardable`. A frozen or unresponsive minimized/background
+page is classified as `browser_suspended` transport liveness. It is not Task completion and is not
+safe evidence for automatic scale-in.
+
 ### Local bridge
 
 A small Node.js HTTP/WebSocket server bound to loopback. It translates structured local
@@ -29,12 +35,19 @@ requests into extension messages and waits for explicit acknowledgements.
 Owns stable conversation bindings, worker-role planning, exact named-agent messaging,
 shared task/status state, and combined snapshots.
 
-### Watcher
+### Watcher and browser watchdogs
 
 The watcher is deterministic. It does not decide what task should be done. Its semantic digest
-contains durable task/status/superstep/interrupt state plus actionable transport faults; ordinary
-UI idle/generating/message churn is excluded. It wakes the main agent on semantic change or,
-while unresolved work/capacity maintenance remains, after the bounded silence interval.
+contains durable task/status/task-step/superstep/interrupt state plus actionable transport faults;
+ordinary UI idle/generating/message churn is excluded. The bridge protocol v4 also keeps a bounded,
+sequence-numbered browser lifecycle event ring, so the watcher can long-poll for tab/extension
+changes and wake before the fixed polling interval. Fixed polling remains the fallback for durable
+state and bridge compatibility.
+
+Transport detection is split into observation-only watchdogs
+(`BrowserSuspensionWatchdog`, `InspectErrorWatchdog`,
+`GeneratingStallWatchdog`, and `BrowserLifecycleWatchdog`). They never mutate task ownership
+or publish canonical state.
 
 ### Bundled MCP servers
 
@@ -168,10 +181,12 @@ future scheduling.
 Tasks may also declare dependency task IDs. A dependent task cannot enter the executable
 frontier until every dependency is `done`. Review tasks route to the reviewer role. Blocked
 tasks are typed: dependency/external waits stay parked, human-input waits interrupt the main
-agent, and recoverable/verification/unknown failures may route to the debugger. Browser
-idleness is an availability signal only and never creates execution pressure by itself.
+agent, recoverable/unknown failures may route to the debugger, and `verification_failure`
+is a zero-pressure wait until concrete runnable repair/verification work exists. Browser idleness
+is an availability signal only and never creates execution pressure by itself.
 
-The watcher polls every 300 seconds by default. Its digest contains durable task/status/
+The watcher polls durable state every 300 seconds by default, but browser lifecycle changes can
+wake it earlier through the bridge event ring. Its digest contains durable task/task-step/status/
 superstep/interrupt state, the active SwarmGraph topology/revision, and actionable transport
 faults; ordinary UI idle/generating/message changes are excluded. A rejected conditional branch
 (`graph_unselected`) is not treated as unresolved work, so it does not create useless safety ticks.

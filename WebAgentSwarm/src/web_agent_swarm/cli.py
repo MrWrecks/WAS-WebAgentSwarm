@@ -3,6 +3,7 @@
 import argparse
 import json
 
+from .benchmark import benchmark_history, run_scheduler_benchmark
 from .bridge import BridgeClient
 from .state import DurableStore
 from .swarm import SwarmRuntime
@@ -31,6 +32,12 @@ def main(argv=None) -> int:
     sub.add_parser("health")
     sub.add_parser("tabs")
     sub.add_parser("snapshot")
+    benchmark = sub.add_parser("benchmark")
+    benchmark.add_argument("--record", action="store_true")
+    benchmark.add_argument("--journal", default="")
+    benchmark_history_parser = sub.add_parser("benchmark-history")
+    benchmark_history_parser.add_argument("--limit", type=int, default=20)
+    benchmark_history_parser.add_argument("--journal", default="")
 
     plan = sub.add_parser("plan")
     plan.add_argument("--workers", type=int, default=0)
@@ -103,6 +110,16 @@ def main(argv=None) -> int:
         emit(bridge.tabs())
     elif args.command == "snapshot":
         emit(swarm.snapshot())
+    elif args.command == "benchmark":
+        emit(run_scheduler_benchmark(
+            record=args.record,
+            journal_path=args.journal,
+        ))
+    elif args.command == "benchmark-history":
+        emit(benchmark_history(
+            limit=args.limit,
+            journal_path=args.journal,
+        ))
     elif args.command == "plan":
         emit(swarm.plan(args.workers, args.roles or None))
     elif args.command == "start":

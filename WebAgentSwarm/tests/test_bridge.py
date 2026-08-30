@@ -22,6 +22,20 @@ class BridgeClientTest(unittest.TestCase):
             timeout=12.0,
         )
 
+    def test_browser_events_support_cursor_and_long_poll(self):
+        client = BridgeClient("http://example.invalid")
+        with mock.patch.object(
+            client,
+            "_json",
+            return_value={"ok": True, "events": [], "latestSeq": 7},
+        ) as bridge_call:
+            result = client.events(since=3, limit=9, wait_ms=1500)
+        self.assertTrue(result["ok"])
+        bridge_call.assert_called_once_with(
+            "/events?since=3&limit=9&waitMs=1500",
+            timeout=4.0,
+        )
+
     def test_send_carries_command_id_for_idempotent_retry(self):
         client = BridgeClient("http://example.invalid")
         with mock.patch.object(

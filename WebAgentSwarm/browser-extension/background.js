@@ -6,7 +6,72 @@ let keepAliveTimer = null;
 let connectInFlight = false;
 const commandResults = new Map();
 const commandInflight = new Map();
+const knownChatTabs = new Map();
 const MAX_COMMAND_CACHE = 256;
+
+function isChatGptTab(tab) {
+  return Boolean(tab?.id && tab?.url?.startsWith('https://chatgpt.com/'));
+}
+
+function serializeTab(tab) {
+  return {
+    id: tab.id,
+    windowId: tab.windowId,
+    index: tab.index,
+    title: tab.title || '',
+    url: tab.url || '',
+    active: Boolean(tab.active),
+    pinned: Boolean(tab.pinned),
+    status: tab.status || '',
+    discarded: Boolean(tab.discarded),
+    frozen: Boolean(tab.frozen),
+    autoDiscardable: tab.autoDiscardable !== false
+  };
+}
+
+async function protectChatTab(tabOrId) {
+  let tab = tabOrId;
+  if (Number.isInteger(tabOrId)) {
+    try {
+      tab = await chrome.tabs.get(tabOrId);
+    } catch {
+      return null;
+    }
+  }
+  if (!isChatGptTab(tab)) {
+    if (tab?.id) knownChatTabs.delete(tab.id);
+    return tab || null;
+  }
+  if (tab.autoDiscardable !== false) {
+    try {
+      tab = await chrome.tabs.update(tab.id, { autoDiscardable: false });
+    } catch {}
+  }
+  if (tab?.id) knownChatTabs.set(tab.id, serializeTab(tab));
+  return tab;
+}
+
+async function protectAllChatTabs() {
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
+  } catch {
+    return;
+  }
+  await Promise.all(tabs.map(tab => protectChatTab(tab)));
+}
+
+async function reviveDiscardedChatTab(tab) {
+  let current = await protectChatTab(tab);
+  if (!current?.discarded) return current;
+  try {
+    await chrome.tabs.reload(current.id);
+    current = await waitForTabComplete(current.id);
+    return await protectChatTab(current);
+  } catch {
+    return current;
+  }
+}
 
 function rememberCommand(commandId, result) {
   if (!commandId) return;
@@ -28,16 +93,31 @@ function sendSocket(payload) {
   }
 }
 
+function emitBrowserEvent(kind, tab = null, changes = {}) {
+  sendSocket({
+    type: 'browser-event',
+    event: {
+      kind: String(kind || 'browser_event'),
+      at: Date.now() / 1000,
+      tab: tab?.id ? serializeTab(tab) : null,
+      tabId: Number.isInteger(tab?.id) ? tab.id : null,
+      windowId: Number.isInteger(tab?.windowId) ? tab.windowId : null,
+      changes: changes && typeof changes === 'object' ? changes : {}
+    }
+  });
+}
+
 async function resolveChatTab(tabId) {
   if (Number.isInteger(tabId)) {
     try {
       const tab = await chrome.tabs.get(tabId);
-      if (tab?.url?.startsWith('https://chatgpt.com/')) return tab;
+      if (tab?.url?.startsWith('https://chatgpt.com/')) return await protectChatTab(tab);
     } catch {}
     return null;
   }
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-  return tabs.find(tab => tab.url?.startsWith('https://chatgpt.com/')) || null;
+  const tab = tabs.find(item => item.url?.startsWith('https://chatgpt.com/')) || null;
+  return await protectChatTab(tab);
 }
 
 async function waitForTabComplete(tabId, timeoutMs = 15000) {
@@ -75,10 +155,12 @@ async function waitForTabComplete(tabId, timeoutMs = 15000) {
 }
 
 async function callContent(tab, message) {
-  const readyTab = (
-    tab?.status === 'complete'
-      ? tab
-      : await waitForTabComplete(tab.id)
+  let readyTab = await protectChatTab(tab);
+  readyTab = await reviveDiscardedChatTab(readyTab);
+  readyTab = (
+    readyTab?.status === 'complete'
+      ? readyTab
+      : await waitForTabComplete(readyTab.id)
   );
   if (!readyTab?.id || !readyTab.url?.startsWith('https://chatgpt.com/')) {
     throw new Error('Target ChatGPT tab did not finish loading.');
@@ -96,7 +178,7 @@ async function callContent(tab, message) {
 }
 
 async function inspect(payload) {
-  const tab = await resolveChatTab(payload.tabId);
+  let tab = await resolveChatTab(payload.tabId);
   if (!tab?.id) {
     sendSocket({
       type: 'inspect-result',
@@ -107,6 +189,7 @@ async function inspect(payload) {
     return;
   }
   try {
+    tab = await reviveDiscardedChatTab(tab);
     const result = await callContent(tab, {
       type: 'inspect-chatgpt',
       tail: payload.tail
@@ -116,22 +199,23 @@ async function inspect(payload) {
       id: payload.id,
       ok: Boolean(result?.ok),
       error: result?.error || null,
-      tab: {
-        id: tab.id,
-        windowId: tab.windowId,
-        index: tab.index,
-        title: tab.title || '',
-        url: tab.url || '',
-        active: Boolean(tab.active)
-      },
+      tab: serializeTab(tab),
       snapshot: result?.snapshot || null
     });
   } catch (error) {
+    let latest = tab;
+    try {
+      latest = await chrome.tabs.get(tab.id);
+    } catch {}
     sendSocket({
       type: 'inspect-result',
       id: payload.id,
       ok: false,
-      error: String(error)
+      error: String(error),
+      tab: latest?.id ? serializeTab(latest) : null,
+      browserState: latest?.discarded
+        ? 'discarded'
+        : (latest?.frozen ? 'frozen' : 'unresponsive')
     });
   }
 }
@@ -232,7 +316,11 @@ async function connect() {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
     clearInterval(keepAliveTimer);
-    keepAliveTimer = setInterval(() => sendSocket({ type: 'ping' }), 20000);
+    protectAllChatTabs();
+    keepAliveTimer = setInterval(() => {
+      sendSocket({ type: 'ping' });
+      protectAllChatTabs();
+    }, 20000);
   };
 
   currentSocket.onmessage = async event => {
@@ -245,18 +333,12 @@ async function connect() {
 
     if (payload.type === 'list-tabs') {
       const tabs = await chrome.tabs.query({});
+      await Promise.all(tabs.map(tab => protectChatTab(tab)));
+      const refreshed = await chrome.tabs.query({});
       sendSocket({
         type: 'tabs-result',
         id: payload.id,
-        tabs: tabs.map(tab => ({
-          id: tab.id,
-          windowId: tab.windowId,
-          index: tab.index,
-          title: tab.title || '',
-          url: tab.url || '',
-          active: Boolean(tab.active),
-          pinned: Boolean(tab.pinned)
-        }))
+        tabs: refreshed.map(serializeTab)
       });
       return;
     }
@@ -271,19 +353,12 @@ async function connect() {
         if (!tab?.id || !tab.url?.startsWith('https://chatgpt.com/')) {
           throw new Error('New ChatGPT tab did not finish loading.');
         }
+        const protectedTab = await protectChatTab(tab);
         sendSocket({
           type: 'open-result',
           id: payload.id,
           ok: true,
-          tab: {
-            id: tab.id,
-            windowId: tab.windowId,
-            index: tab.index,
-            title: tab.title || '',
-            url: tab.url || payload.url || '',
-            active: Boolean(tab.active),
-            pinned: Boolean(tab.pinned)
-          }
+          tab: serializeTab(protectedTab || tab)
         });
       } catch (error) {
         sendSocket({
@@ -355,6 +430,59 @@ chrome.storage.onChanged.addListener(changes => {
   }
 });
 
-chrome.runtime.onInstalled.addListener(connect);
-chrome.runtime.onStartup.addListener(connect);
+chrome.tabs.onCreated.addListener(tab => {
+  protectChatTab(tab).then(protectedTab => {
+    if (isChatGptTab(protectedTab)) {
+      emitBrowserEvent('tab_created', protectedTab, {});
+    }
+  });
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  const previous = knownChatTabs.get(tabId) || null;
+  const relevant = (
+    Object.prototype.hasOwnProperty.call(changeInfo, 'url')
+    || Object.prototype.hasOwnProperty.call(changeInfo, 'status')
+    || Object.prototype.hasOwnProperty.call(changeInfo, 'discarded')
+    || Object.prototype.hasOwnProperty.call(changeInfo, 'frozen')
+    || Object.prototype.hasOwnProperty.call(changeInfo, 'autoDiscardable')
+  );
+  protectChatTab(tab || tabId).then(protectedTab => {
+    if (isChatGptTab(protectedTab)) {
+      if (relevant) emitBrowserEvent('tab_lifecycle', protectedTab, changeInfo);
+      return;
+    }
+    if (previous && relevant) {
+      emitBrowserEvent('tab_unmanaged', previous, changeInfo);
+      knownChatTabs.delete(tabId);
+    }
+  });
+});
+
+chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
+  const previous = knownChatTabs.get(tabId) || null;
+  if (!previous) return;
+  knownChatTabs.delete(tabId);
+  emitBrowserEvent('tab_removed', previous, {
+    isWindowClosing: Boolean(removeInfo?.isWindowClosing)
+  });
+});
+
+chrome.tabs.onActivated.addListener(activeInfo => {
+  chrome.tabs.get(activeInfo.tabId)
+    .then(tab => {
+      if (isChatGptTab(tab)) emitBrowserEvent('tab_activated', tab, {});
+    })
+    .catch(() => {});
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  protectAllChatTabs();
+  connect();
+});
+chrome.runtime.onStartup.addListener(() => {
+  protectAllChatTabs();
+  connect();
+});
+protectAllChatTabs();
 connect();

@@ -62,6 +62,20 @@ class BridgeClient:
     def tabs(self) -> Dict[str, object]:
         return self._json("/tabs", timeout=6.0)
 
+    def events(
+        self,
+        since: int = 0,
+        limit: int = 100,
+        wait_ms: int = 0,
+    ) -> Dict[str, object]:
+        query = parse.urlencode({
+            "since": max(0, int(since or 0)),
+            "limit": max(1, min(int(limit or 100), 512)),
+            "waitMs": max(0, min(int(wait_ms or 0), 30000)),
+        })
+        timeout = max(self.timeout, (max(0, int(wait_ms or 0)) / 1000.0) + 2.0)
+        return self._json("/events?" + query, timeout=timeout)
+
     def open_tab(
         self,
         url: str = "https://chatgpt.com/",

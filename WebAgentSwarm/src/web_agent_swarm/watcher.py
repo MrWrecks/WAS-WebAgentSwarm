@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from .swarm import SwarmRuntime
+from .watchdogs import BrowserLifecycleWatchdog, collect_snapshot_alerts
 
 
 TICK = (
@@ -44,32 +45,13 @@ def _stable(value: Any) -> Any:
 
 
 def _transport_alerts(snapshot: dict):
-    alerts = []
-    for item in snapshot.get("agents", []):
-        if item.get("name") == "main":
-            continue
-        binding = item.get("binding") or {}
-        if isinstance(binding, dict) and binding.get("suspended"):
-            continue
-        ui = item.get("ui") or {}
-        error = str(item.get("error") or "").strip()
-        if error:
-            alerts.append({
-                "name": item.get("name"),
-                "kind": "inspect_error",
-                "error": error,
-            })
-        if ui.get("stuckGenerating"):
-            alerts.append({
-                "name": item.get("name"),
-                "kind": "stuck_generating",
-            })
-    return alerts
+    return collect_snapshot_alerts(snapshot)
 
 
 def _digest(snapshot: dict) -> str:
     payload = {
         "tasks": snapshot.get("tasks", []),
+        "task_steps": snapshot.get("task_steps", []),
         "shared_status": snapshot.get("shared_status", {}),
         "supersteps": snapshot.get("supersteps", []),
         "interrupts": snapshot.get("interrupts", []),
@@ -89,6 +71,124 @@ def _digest(snapshot: dict) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _watch_snapshot(runtime: SwarmRuntime) -> dict:
+    """Build a watcher snapshot without inspecting every worker DOM.
+
+    The watcher only needs durable coordination state plus a writable main Web
+    turn. Worker DOM inspection belongs to the main Agent after it receives the
+    tick. This prevents one frozen/unresponsive worker from serially blocking
+    the heartbeat loop.
+    """
+    bindings = runtime.store.bindings()
+    agents = []
+    main_binding = bindings.get("main") if isinstance(bindings, dict) else None
+    main_tab = runtime._resolve("main")
+    main_item = {
+        "name": "main",
+        "binding": main_binding,
+        "open": bool(main_tab),
+        "tab": main_tab,
+        "ui": None,
+        "error": None,
+        "browser_state": (
+            "discarded"
+            if bool((main_tab or {}).get("discarded"))
+            else (
+                "frozen"
+                if bool((main_tab or {}).get("frozen"))
+                else ("active" if main_tab else "closed")
+            )
+        ),
+    }
+    if main_tab:
+        inspected = runtime.bridge.inspect(int(main_tab["id"]), tail=2)
+        if inspected.get("ok"):
+            main_item["ui"] = inspected.get("snapshot")
+            inspected_tab = inspected.get("tab")
+            if isinstance(inspected_tab, dict):
+                main_item["tab"] = inspected_tab
+                main_item["browser_state"] = (
+                    "discarded"
+                    if bool(inspected_tab.get("discarded"))
+                    else (
+                        "frozen"
+                        if bool(inspected_tab.get("frozen"))
+                        else "active"
+                    )
+                )
+        else:
+            main_item["error"] = inspected.get("error")
+            hint = str(inspected.get("browserState") or "").strip()
+            if hint in {"discarded", "frozen", "unresponsive"}:
+                main_item["browser_state"] = hint
+            elif "Timed out waiting for extension response" in str(
+                inspected.get("error") or ""
+            ):
+                main_item["browser_state"] = "unresponsive"
+    else:
+        main_item["error"] = "bound conversation is not currently open"
+    agents.append(main_item)
+
+    for name in sorted(bindings):
+        if name == "main":
+            continue
+        binding = bindings[name]
+        agents.append({
+            "name": name,
+            "binding": binding,
+            "open": None,
+            "tab": None,
+            "ui": None,
+            "error": None,
+            "browser_state": "unknown",
+        })
+
+    coordination = runtime.coordination_plan()
+    kind_by_task = {
+        str(node.get("task_id") or ""): str(node.get("blocker_kind") or "")
+        for node in coordination.get("task_nodes", [])
+        if isinstance(node, dict)
+    }
+    route_by_task = {
+        str(node.get("task_id") or ""): str(node.get("route") or "")
+        for node in coordination.get("task_nodes", [])
+        if isinstance(node, dict)
+    }
+    tasks = []
+    for task in runtime.store.tasks():
+        item = dict(task)
+        task_id = str(item.get("task_id") or "")
+        if str(item.get("status") or "").lower() == "blocked":
+            item["blocker_kind"] = (
+                kind_by_task.get(task_id)
+                or runtime._blocker_kind(item)
+            )
+        item["route"] = route_by_task.get(task_id) or "terminal"
+        tasks.append(item)
+
+    durable = runtime.store.load()
+    return {
+        "ok": True,
+        "agents": agents,
+        "tasks": tasks,
+        "task_steps": [
+            dict(record)
+            for steps in durable.get("task_steps", {}).values()
+            if isinstance(steps, dict)
+            for record in steps.values()
+            if isinstance(record, dict)
+        ],
+        "shared_status": runtime.store.status(),
+        "supersteps": runtime.store.supersteps(include_pending=False),
+        "interrupts": runtime.store.interrupts(),
+        "active_graph": runtime.store.graph_get(),
+        "lanes": list(durable.get("lanes", {}).values()),
+        "resource_claims": list(durable.get("resource_claims", {}).values()),
+        "commits": list(durable.get("commits", {}).values()),
+        "canonical_epoch": int(durable.get("canonical_epoch") or 0),
+    }
+
+
 def _has_unresolved_work(snapshot: dict) -> bool:
     now = time.time()
     for task in snapshot.get("tasks", []):
@@ -106,7 +206,11 @@ def _has_unresolved_work(snapshot: dict) -> bool:
             return True
         if status == "blocked":
             kind = str(task.get("blocker_kind") or "unknown_blocker")
-            if kind not in {"dependency_wait", "external_wait"}:
+            if kind not in {
+                "dependency_wait",
+                "external_wait",
+                "verification_failure",
+            }:
                 return True
 
     for step in snapshot.get("supersteps", []):
@@ -141,20 +245,81 @@ def _has_unresolved_work(snapshot: dict) -> bool:
         if not isinstance(agent, dict) or agent.get("name") == "main":
             continue
         binding = agent.get("binding") or {}
+        if isinstance(binding, dict) and binding.get("suspended"):
+            continue
+        if str(agent.get("browser_state") or "") in {
+            "discarded",
+            "frozen",
+            "unresponsive",
+        }:
+            return True
         if (
             isinstance(binding, dict)
-            and not binding.get("suspended")
             and float(binding.get("excess_since") or 0.0) > 0.0
         ):
             return True
     return False
 
 
+def _scale_out_productive_work(runtime: SwarmRuntime) -> dict:
+    """Apply only durable-pressure scale-out; never remove workers here.
+
+    This lets natural fan-out and safe JIT sidecars become real browser workers
+    without waiting for the main Agent to perform a second scheduling turn.
+    Scale-in remains on the guarded orchestrator path so a stuck worker UI cannot
+    block this lightweight watcher loop.
+    """
+    elastic = runtime.elastic_plan(
+        max_new_roles=4,
+        max_instances_per_role=4,
+        max_total_workers=6,
+    )
+    if not elastic.get("ok"):
+        return elastic
+    additions = [
+        item
+        for item in elastic.get("add_instances", [])
+        if isinstance(item, dict) and int(item.get("count") or 0) > 0
+    ]
+    if not additions:
+        return {"ok": True, "scaled": False, "targets": {}}
+
+    active = elastic.get("active_instances") or {}
+    targets = {
+        str(item.get("role") or ""): (
+            int(active.get(str(item.get("role") or ""), 0))
+            + int(item.get("count") or 0)
+        )
+        for item in additions
+        if str(item.get("role") or "")
+    }
+    if not targets:
+        return {"ok": True, "scaled": False, "targets": {}}
+    result = runtime.scale(
+        requested_instances=targets,
+        start_watch=False,
+    )
+    result["targets"] = targets
+    return result
+
+
+def _browser_event_requires_tick(event: dict) -> bool:
+    return BrowserLifecycleWatchdog.requires_tick(event)
+
+
 def _main_idle(snapshot: dict) -> bool:
     for item in snapshot.get("agents", []):
         if item.get("name") != "main":
             continue
+        if str(item.get("browser_state") or "") in {
+            "discarded",
+            "frozen",
+            "unresponsive",
+        }:
+            return False
         ui = item.get("ui") or {}
+        if item.get("error") and not ui:
+            return False
         return bool(item.get("open")) and not bool(ui.get("generating"))
     return False
 
@@ -164,9 +329,17 @@ def run(interval: float = 300.0, max_silence: float = 300.0, once: bool = False)
     last_digest = None
     last_sent = 0.0
     pending = True
+    browser_event_seq = 0
 
     while True:
-        snapshot = runtime.snapshot(tail=2)
+        # Keep productive parallelism work-conserving without inspecting worker
+        # DOMs: materialize only bounded safe sidecars from durable primary work.
+        runtime.ensure_parallelism(
+            max_sidecars_per_primary=2,
+            max_new_sidecars=4,
+        )
+        _scale_out_productive_work(runtime)
+        snapshot = _watch_snapshot(runtime)
         digest = _digest(snapshot)
         if last_digest is None or digest != last_digest:
             pending = True
@@ -190,7 +363,30 @@ def run(interval: float = 300.0, max_silence: float = 300.0, once: bool = False)
 
         if last_digest is None:
             last_digest = digest
-        time.sleep(max(2.0, float(interval)))
+
+        wait_ms = int(max(2.0, float(interval)) * 1000)
+        event_result = runtime.bridge.events(
+            since=browser_event_seq,
+            limit=64,
+            wait_ms=min(wait_ms, 30000),
+        )
+        if event_result.get("ok"):
+            events = [
+                event
+                for event in event_result.get("events", [])
+                if isinstance(event, dict)
+            ]
+            if events:
+                browser_event_seq = max(
+                    browser_event_seq,
+                    max(int(event.get("seq") or 0) for event in events),
+                )
+                if any(_browser_event_requires_tick(event) for event in events):
+                    pending = True
+            elif wait_ms > 30000:
+                time.sleep((wait_ms - 30000) / 1000.0)
+        else:
+            time.sleep(max(2.0, float(interval)))
 
 
 def main(argv=None) -> int:

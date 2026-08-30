@@ -6,6 +6,43 @@ const HOST = process.env.WEB_SWARM_BIND || '127.0.0.1';
 const PORT = Number.parseInt(process.env.WEB_SWARM_PORT || '8788', 10);
 const clients = new Set();
 const pending = new Map();
+const browserEvents = [];
+const eventWaiters = new Set();
+const MAX_BROWSER_EVENTS = 512;
+let browserEventSeq = 0;
+
+function browserEventsSince(since = 0, limit = 100) {
+  const cleanSince = Math.max(0, Number.parseInt(String(since || 0), 10) || 0);
+  const cleanLimit = Math.max(1, Math.min(Number.parseInt(String(limit || 100), 10) || 100, 512));
+  return browserEvents.filter(event => event.seq > cleanSince).slice(0, cleanLimit);
+}
+
+function flushEventWaiters() {
+  for (const waiter of [...eventWaiters]) {
+    const events = browserEventsSince(waiter.since, waiter.limit);
+    if (!events.length) continue;
+    clearTimeout(waiter.timer);
+    eventWaiters.delete(waiter);
+    json(waiter.res, 200, {
+      ok: true,
+      events,
+      latestSeq: browserEventSeq
+    });
+  }
+}
+
+function appendBrowserEvent(kind, payload = {}) {
+  const event = {
+    seq: ++browserEventSeq,
+    at: Date.now() / 1000,
+    kind: String(kind || 'unknown'),
+    ...payload
+  };
+  browserEvents.push(event);
+  while (browserEvents.length > MAX_BROWSER_EVENTS) browserEvents.shift();
+  flushEventWaiters();
+  return event;
+}
 
 function json(res, status, body) {
   if (res.writableEnded) return;
@@ -72,9 +109,45 @@ const server = http.createServer((req, res) => {
     return json(res, 200, {
       ok: true,
       extensionClients: [...clients].filter(ws => ws.readyState === WebSocket.OPEN).length,
-      protocolVersion: 3,
+      protocolVersion: 4,
+      browserEventSeq,
       profilePolicy: 'current_connected_browser_profile_only'
     });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/events') {
+    const since = Math.max(
+      0,
+      Number.parseInt(url.searchParams.get('since') || '0', 10) || 0
+    );
+    const limit = Math.max(
+      1,
+      Math.min(Number.parseInt(url.searchParams.get('limit') || '100', 10) || 100, 512)
+    );
+    const waitMs = Math.max(
+      0,
+      Math.min(Number.parseInt(url.searchParams.get('waitMs') || '0', 10) || 0, 30000)
+    );
+    const events = browserEventsSince(since, limit);
+    if (events.length || waitMs <= 0) {
+      return json(res, 200, { ok: true, events, latestSeq: browserEventSeq });
+    }
+    const waiter = {
+      res,
+      since,
+      limit,
+      timer: setTimeout(() => {
+        eventWaiters.delete(waiter);
+        json(res, 200, { ok: true, events: [], latestSeq: browserEventSeq });
+      }, waitMs)
+    };
+    eventWaiters.add(waiter);
+    res.on('close', () => {
+      if (res.writableEnded || !eventWaiters.has(waiter)) return;
+      clearTimeout(waiter.timer);
+      eventWaiters.delete(waiter);
+    });
+    return;
   }
 
   if (req.method === 'GET' && url.pathname === '/tabs') {
@@ -168,11 +241,25 @@ const wss = new WebSocketServer({
 
 wss.on('connection', ws => {
   clients.add(ws);
+  appendBrowserEvent('extension_connected', {
+    extensionClients: [...clients].filter(client => client.readyState === WebSocket.OPEN).length
+  });
 
   ws.on('message', raw => {
     try {
       const msg = JSON.parse(raw.toString());
       if (msg.type === 'ping') return;
+      if (msg.type === 'browser-event') {
+        const event = msg.event && typeof msg.event === 'object' ? msg.event : {};
+        appendBrowserEvent(event.kind || 'browser_event', {
+          sourceAt: Number(event.at || 0) || null,
+          tab: event.tab && typeof event.tab === 'object' ? event.tab : null,
+          tabId: Number.isInteger(event.tabId) ? event.tabId : null,
+          windowId: Number.isInteger(event.windowId) ? event.windowId : null,
+          changes: event.changes && typeof event.changes === 'object' ? event.changes : {}
+        });
+        return;
+      }
       const item = pending.get(msg.id);
       if (!item || item.type !== msg.type) return;
       clearTimeout(item.timer);
@@ -185,7 +272,12 @@ wss.on('connection', ws => {
     } catch {}
   });
 
-  ws.on('close', () => clients.delete(ws));
+  ws.on('close', () => {
+    clients.delete(ws);
+    appendBrowserEvent('extension_disconnected', {
+      extensionClients: [...clients].filter(client => client.readyState === WebSocket.OPEN).length
+    });
+  });
 });
 
 server.listen(PORT, HOST, () => {

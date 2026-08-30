@@ -454,6 +454,123 @@ class SwarmRuntimeTest(unittest.TestCase):
                 },
             )
 
+    def test_verification_failure_is_wait_not_worker_pressure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = FakeBridge()
+            store = DurableStore(Path(tmp))
+            swarm = SwarmRuntime(bridge=bridge, store=store)
+            store.task_create(
+                "Wait for fresh verifier candidate",
+                owner="tester",
+                task_id="verify-wait",
+            )
+            store.task_update(
+                "verify-wait",
+                status="blocked",
+                summary="verification_failure: waiting for fresh upstream candidate",
+            )
+
+            plan = swarm.coordination_plan(
+                active_roles=["tester"],
+                max_new_roles=3,
+            )
+            node = next(
+                item for item in plan["task_nodes"]
+                if item["task_id"] == "verify-wait"
+            )
+            self.assertEqual(node["route"], "wait_verification")
+            self.assertEqual(node["blocker_kind"], "verification_failure")
+            self.assertEqual(plan["scale_recommendation"]["add_roles"], [])
+            tester_pressure = next(
+                item for item in plan["role_pressure"]
+                if item["role"] == "tester"
+            )
+            self.assertEqual(tester_pressure["desired_instances"], 0)
+
+    def test_wait_only_role_bypasses_scale_in_grace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = FakeBridge()
+            store = DurableStore(Path(tmp))
+            swarm = SwarmRuntime(bridge=bridge, store=store)
+            started = swarm.start(["tester"], start_watch=False)
+            self.assertTrue(started["ok"])
+            store.task_create(
+                "Wait for fresh candidate",
+                owner="tester",
+                task_id="verify-wait-close",
+            )
+            store.task_update(
+                "verify-wait-close",
+                status="blocked",
+                summary="verification_failure: waiting for fresh upstream candidate",
+            )
+
+            scaled = swarm.scale(
+                scale_in_grace_seconds=300,
+                start_watch=False,
+            )
+            self.assertTrue(scaled["ok"])
+            self.assertIn("tester", scaled["immediate_wait_scale_in_roles"])
+            self.assertEqual(scaled["removed_workers"], ["tester"])
+            self.assertEqual(scaled["scale_in_deferred"], [])
+            self.assertEqual(scaled["worker_count"], 0)
+
+    def test_ensure_parallelism_materializes_bounded_safe_sidecars_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = FakeBridge()
+            store = DurableStore(Path(tmp))
+            swarm = SwarmRuntime(bridge=bridge, store=store)
+            store.task_create(
+                "Primary implementation",
+                owner="implementer",
+                task_id="primary",
+                resource_hints=["src/core.py"],
+                canonical_root=".",
+            )
+
+            first = swarm.ensure_parallelism(
+                max_sidecars_per_primary=2,
+                max_new_sidecars=4,
+            )
+            self.assertTrue(first["ok"])
+            self.assertEqual(first["count"], 2)
+            assists = store.task_assists("primary", include_terminal=True)
+            self.assertEqual(len(assists), 2)
+            self.assertEqual(
+                {task["assist_write_policy"] for task in assists},
+                {"experiment_only", "proposal_only"},
+            )
+            self.assertTrue(all(
+                task["assist_write_policy"] in {
+                    "readonly", "proposal_only", "experiment_only"
+                }
+                for task in assists
+            ))
+            self.assertTrue(all(
+                bool((task.get("payload") or {}).get("auto_sidecar"))
+                for task in assists
+            ))
+
+            second = swarm.ensure_parallelism(
+                max_sidecars_per_primary=2,
+                max_new_sidecars=4,
+            )
+            self.assertTrue(second["ok"])
+            self.assertEqual(second["count"], 0)
+            self.assertEqual(
+                len(store.task_assists("primary", include_terminal=True)),
+                2,
+            )
+
+            plan = swarm.coordination_plan(
+                active_roles=["implementer"],
+                max_new_roles=4,
+            )
+            self.assertEqual(
+                set(plan["scale_recommendation"]["add_roles"]),
+                {"tester", "reviewer"},
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

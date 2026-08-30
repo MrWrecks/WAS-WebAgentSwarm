@@ -10,16 +10,23 @@ when worker state changes.
 
 - Open or reuse multiple ChatGPT Web conversations.
 - Start a main orchestrator alone by default, then elastically create/reuse worker roles from durable parallel pressure; explicit worker sets are still supported.
-- Inspect bounded visible UI state: idle/generating and recent visible messages.
+- Inspect bounded visible UI state: idle/generating, recent visible messages, and browser lifecycle state.
+- Protect managed ChatGPT Agent tabs with `autoDiscardable=false`; detect `discarded/frozen/unresponsive` tabs and treat them as transport faults rather than completion.
 - Send an exact message to an exact ChatGPT tab or stable conversation binding.
 - Keep a small durable task board and shared status store outside chat history.
 - Recommend a worker count/role subset before opening browser tabs.
 - Persist an explicit mutable `SwarmGraph` with task/control/router/join nodes, dependency/conditional edges, revision-safe edits, and activation/deactivation.
 - Derive dependency-aware conditional routes, fan-out frontiers, fan-in barriers, and interrupts from durable tasks.
 - Elastically add or safely suspend worker instances as durable task pressure changes, under a global worker budget and scale-in hysteresis.
+- Keep waiting-only verification blockers at zero worker pressure; a blocked task does not keep a browser worker alive unless concrete runnable follow-up exists.
+- Automatically materialize up to two safe JIT sidecars for a single runnable primary when natural parallel frontier work is absent; automatic sidecars are readonly, proposal-only, or experiment-only and never create a competing canonical writer.
 - Persist human-input interrupts/resume values and bounded coordination checkpoints for safe recovery/time-travel.
+- Preserve checkpoint ancestry/head across restore-and-resume branches so replay history remains auditable.
+- Cache expensive deterministic task sub-steps with leases, automatic MVCC-aware fingerprints, and reusable durable results.
+- Receive browser lifecycle events through a bounded bridge event ring and split transport health into independent watchdogs; fixed-interval polling remains a fallback rather than the only wake mechanism.
+- Run deterministic scheduler benchmark episodes with explicit invariants/reward for fan-out, sidecars, waits, fan-in, and worker budgets.
 - Poll durable swarm state every 5 minutes by default; UI-only idle/generating/message changes do not create semantic ticks.
-- Wake the main agent on durable task/superstep changes, actionable transport faults, or a 5-minute unresolved-work safety wake.
+- Wake the main agent on durable task/superstep/step-cache changes, actionable browser lifecycle faults, or a 5-minute unresolved-work safety wake.
 - Start that watcher automatically when a confirmed swarm is launched, and restart it when watcher parameters change.
 - Optionally expose the same controls as MCP tools.
 - Bundle a clean-room CodexPro-compatible local development MCP for workspace inspection, edits, verification commands, background tasks, handoff, and context management.
@@ -49,8 +56,8 @@ localhost bridge (Node.js)
         v
 Python swarm runtime
    |        |          |
-   |        |          +-- event-aware watcher
-   |        +------------- durable task/status store
+   |        |          +-- event-aware watcher + watchdogs
+   |        +------------- durable task/status/step/checkpoint store
    +---------------------- optional MCP server
                                 ^
                                 |
@@ -176,9 +183,20 @@ safe excess worker is suspended/closed, preventing 3→4→3→4 tab thrashing. 
 counts bypass that grace because they are direct operator intent.
 
 Tasks can declare dependencies, so downstream work stays behind a durable fan-in
-barrier until prerequisites are `done`. Review work routes to `reviewer`, blocked
-work routes to `debugger`, and browser idle alone never triggers scale-out. The
-design borrows LangGraph-style graph semantics without requiring LangGraph at runtime.
+barrier until prerequisites are `done`. Review work routes to `reviewer`. Actionable
+recoverable/unknown blockers may route to `debugger`, but `verification_failure`
+is a waiting route with zero worker pressure until a concrete ready/active repair or
+verification sidecar exists. Browser idle alone never triggers scale-out.
+
+When exactly one runnable/leased primary would otherwise serialize progress, the
+watcher materializes at most two bounded safe JIT sidecars and immediately applies
+**scale-out only** from the resulting durable pressure, so those tasks become real
+browser workers without waiting for a second main-agent scheduling turn. The watcher
+never performs scale-in; guarded removal remains on the orchestrator path so a frozen
+worker UI cannot stall heartbeat delivery. If multiple primary/map shards are already
+runnable, WAS prefers that natural parallel frontier and does not add synthetic
+sidecars that would steal the worker budget. The design borrows LangGraph-style graph
+semantics without requiring LangGraph at runtime.
 
 Example explicit instance control:
 
@@ -189,6 +207,62 @@ web-agent-swarm scale --instances implementer=6
 
 The second command treats the count as a target total, so it adds only the missing
 `implementer-5` / `implementer-6` instances and preserves the existing workers.
+
+### Durable task steps and checkpoint lineage
+
+Task-level durability is not enough for expensive multi-phase work. WAS therefore exposes
+a per-task step cache:
+
+```text
+swarm_task_step_fingerprint
+        |
+        v
+swarm_task_step_acquire
+   | execute/resume -> run expensive phase -> heartbeat -> complete
+   | wait           -> another worker owns identical work
+   + reuse          -> consume saved result immediately
+```
+
+The automatic fingerprint includes structured inputs, task payload, canonical workspace
+identity, canonical epoch, and MVCC resource version/SHA records. A committed source change
+therefore invalidates the cached step without relying on an agent to remember to change a
+manual cache key.
+
+Coordination checkpoints also form an explicit ancestry chain. Restoring checkpoint `N`
+moves the checkpoint head to `N`; the first checkpoint created after resume records `N`
+as its parent. `swarm_checkpoint_lineage` exposes that branch for replay/audit tooling.
+
+### Browser lifecycle event ring and watchdogs
+
+The extension emits browser lifecycle events to bridge protocol v4. The bridge keeps a
+bounded 512-event sequence ring and exposes cursor-based long polling through `/events`.
+The watcher can therefore wake early on extension connect/disconnect, tab create/remove,
+navigation/status changes, discard, or freeze while retaining fixed-interval durable polling
+as a fallback.
+
+Transport detection is split into small watchdogs rather than one monolithic snapshot rule:
+
+- `BrowserSuspensionWatchdog`
+- `InspectErrorWatchdog`
+- `GeneratingStallWatchdog`
+- `BrowserLifecycleWatchdog`
+
+Watchdogs are observation-only: they never mutate task ownership or publish canonical state.
+
+### Deterministic scheduler benchmark
+
+Run:
+
+```bash
+web-agent-swarm benchmark
+```
+
+or call `web_agent_swarm_benchmark` over MCP. The initial benchmark revision
+`was-scheduler-v1` checks five deterministic episodes: single-primary safe sidecars,
+natural four-way fan-out, verification-wait zero pressure, fan-in dependency barriers,
+and the global worker budget. Results include per-episode metrics, invariant evidence,
+latency, and a simple reward so scheduler changes can be compared instead of judged only
+from browser-window appearance.
 
 ### MVCC development lanes
 

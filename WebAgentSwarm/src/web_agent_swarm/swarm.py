@@ -210,7 +210,6 @@ class SwarmRuntime:
         if status == "review":
             return "reviewer"
         if status == "blocked" and blocker_kind in {
-            "verification_failure",
             "recoverable_failure",
             "unknown_blocker",
         }:
@@ -390,6 +389,12 @@ class SwarmRuntime:
                 elif blocker_kind == "human_input":
                     route = "interrupt_human"
                     interrupts.append(blocked_record)
+                elif blocker_kind == "verification_failure":
+                    # Blocked verification records durable evidence but contribute
+                    # zero worker pressure. Concrete follow-up must exist as a
+                    # ready/active repair task or JIT sidecar.
+                    route = "wait_verification"
+                    waits.append(blocked_record)
                 else:
                     route = "interrupt"
                     interrupts.append(blocked_record)
@@ -751,6 +756,142 @@ class SwarmRuntime:
             },
         }
 
+    def ensure_parallelism(
+        self,
+        max_sidecars_per_primary: int = 2,
+        max_new_sidecars: int = 4,
+    ) -> Dict[str, object]:
+        """Materialize bounded safe JIT sidecars for runnable primaries.
+
+        This is intentionally conservative: automatic helpers are restricted to
+        readonly/proposal_only/experiment_only policies. Canonical or disjoint
+        writes are never auto-created, so one primary writer remains authoritative.
+        """
+        per_primary = max(0, min(int(max_sidecars_per_primary or 0), 2))
+        total_limit = max(0, min(int(max_new_sidecars or 0), 8))
+        if per_primary <= 0 or total_limit <= 0:
+            return {"ok": True, "created": [], "count": 0}
+
+        coordination = self.coordination_plan()
+        if not coordination.get("ok"):
+            return coordination
+
+        safe_policies = {"readonly", "proposal_only", "experiment_only"}
+        created = []
+        skipped = []
+        opportunities = [
+            item
+            for item in coordination.get("sidecar_opportunities", [])
+            if isinstance(item, dict)
+        ]
+
+        # Prefer natural graph/map parallelism over synthetic helpers. Automatic
+        # sidecars are a single-primary anti-serialization mechanism, not extra
+        # load when multiple primary tasks are already runnable in parallel.
+        if len(opportunities) != 1:
+            return {
+                "ok": True,
+                "created": [],
+                "count": 0,
+                "skipped": [{
+                    "reason": (
+                        "natural_parallel_frontier"
+                        if len(opportunities) > 1
+                        else "no_sidecar_opportunity"
+                    ),
+                    "primary_count": len(opportunities),
+                }],
+            }
+
+        for opportunity in opportunities:
+            if len(created) >= total_limit:
+                break
+            if not isinstance(opportunity, dict):
+                continue
+            parent_task_id = str(opportunity.get("parent_task_id") or "").strip()
+            if not parent_task_id:
+                continue
+
+            # Never keep re-spawning helpers for the same primary. If the primary
+            # needs another round later, the orchestrator can create it explicitly.
+            if self.store.task_assists(parent_task_id, include_terminal=True):
+                skipped.append({
+                    "parent_task_id": parent_task_id,
+                    "reason": "assist_history_exists",
+                })
+                continue
+
+            parent_title = str(opportunity.get("title") or parent_task_id)
+            canonical_root = str(opportunity.get("canonical_root") or "")
+            resource_hints = list(opportunity.get("resource_hints") or [])
+            made_for_parent = 0
+
+            for suggestion in opportunity.get("suggestions", []):
+                if len(created) >= total_limit or made_for_parent >= per_primary:
+                    break
+                if not isinstance(suggestion, dict):
+                    continue
+                write_policy = str(suggestion.get("write_policy") or "").strip().lower()
+                if write_policy not in safe_policies:
+                    skipped.append({
+                        "parent_task_id": parent_task_id,
+                        "reason": "unsafe_auto_write_policy",
+                        "write_policy": write_policy,
+                    })
+                    continue
+
+                assist_kind = str(suggestion.get("assist_kind") or "").strip().lower()
+                role = str(suggestion.get("role") or "").strip().lower()
+                if role not in DEFAULT_ROLES or not assist_kind:
+                    continue
+                purpose = str(suggestion.get("purpose") or "").strip()
+                stable = uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    "web-agent-swarm:{0}:{1}:{2}".format(
+                        parent_task_id,
+                        assist_kind,
+                        role,
+                    ),
+                ).hex[:10]
+                task_id = "assist_auto_" + stable
+                try:
+                    task = self.store.task_create(
+                        title="Auto {0}: {1}".format(assist_kind, parent_title),
+                        description=purpose,
+                        owner=role,
+                        task_id=task_id,
+                        parent_task_id=parent_task_id,
+                        assist_parent_task_id=parent_task_id,
+                        assist_kind=assist_kind,
+                        assist_write_policy=write_policy,
+                        resource_hints=resource_hints,
+                        canonical_root=canonical_root,
+                        payload={
+                            "auto_sidecar": True,
+                            "purpose": purpose,
+                            "primary_task_id": parent_task_id,
+                        },
+                        max_attempts=2,
+                    )
+                except ValueError as exc:
+                    if "task_id already exists" in str(exc):
+                        continue
+                    raise
+                created.append(task)
+                made_for_parent += 1
+
+        return {
+            "ok": True,
+            "created": created,
+            "count": len(created),
+            "skipped": skipped,
+            "policy": (
+                "Auto fan-out is bounded and safe: only readonly/proposal_only/"
+                "experiment_only sidecars are materialized; canonical writes remain "
+                "single-writer and disjoint_write requires explicit orchestration."
+            ),
+        }
+
     def elastic_plan(
         self,
         max_new_roles: int = 6,
@@ -868,7 +1009,12 @@ class SwarmRuntime:
             "claims for non-writing sidecars and write claims only when policy permits. Open the returned "
             "lane workspace in CodexPro and mutate/run commands only there; canonical mutation is guarded. "
             "Heartbeat long lanes, call swarm_lane_commit before task_release, and on conflict preserve "
-            "the old lane and use swarm_lane_fork/rebase rather than overwriting. If a task carries "
+            "the old lane and use swarm_lane_fork/rebase rather than overwriting. For expensive deterministic "
+            "sub-steps (large tests, benchmarks, downloads, external API/agent phases), first call "
+            "swarm_task_step_fingerprint with stable structured inputs/resource paths, then pass its fingerprint "
+            "to swarm_task_step_acquire: reuse means consume the saved result without re-running, wait means "
+            "another worker owns the same step, and execute/resume "
+            "means heartbeat and finish it with swarm_task_step_complete. If a task carries "
             "payload/group_id, treat it as one map shard and return a compact reducer-friendly result. "
             "Be work-conserving: after releasing one task, immediately re-read the coordination plan and "
             "claim the next eligible task for this exact worker/role in the same turn when useful; stop only "
@@ -888,10 +1034,12 @@ class SwarmRuntime:
             "changes, and pass expected_revision when coordinating concurrent graph edits. If this "
             "is main-only bootstrap, use web_agent_swarm_elastic_plan and web_agent_swarm_scale "
             "to create only the worker topology justified by the durable parallel frontier. Never open "
-            "workers for future dependency-wait stages. Inspect sidecar_opportunities for each current "
-            "dispatch/leased primary: when there is genuinely orthogonal work, create one or two JIT helpers "
-            "with swarm_task_assist before scaling. Prefer readonly_analysis, verification, or disjoint_write "
-            "sidecars. If a helper needs to inspect the same files the primary is writing, make it "
+            "workers for future dependency-wait stages. Safe JIT sidecars may already have been "
+            "materialized automatically for a single runnable primary; inspect parallel_sidecars first and "
+            "never duplicate them. If sidecar_opportunities remain and genuinely orthogonal work still exists, "
+            "create at most one or two explicit helpers with swarm_task_assist. Prefer readonly_analysis, "
+            "verification, or disjoint_write sidecars. If a helper needs to inspect the same files the primary "
+            "is writing, make it "
             "proposal_only/readonly: one primary writer owns that write-set and the helper returns evidence, "
             "tests, or a concrete patch proposal rather than competing for the same file. Do not create "
             "sidecars merely to keep tabs busy. Treat task status plus dependency and SwarmGraph truth as graph routing: dispatch independent "
@@ -1454,6 +1602,8 @@ class SwarmRuntime:
         }
         target_counts = dict(current_counts)
         elastic = None
+        parallelism = None
+        immediate_wait_scale_in_roles = set()
         automatic_scaling = (
             requested_instances is None
             and not requested_roles
@@ -1480,6 +1630,12 @@ class SwarmRuntime:
             for role in plan["roles"]:
                 target_counts[role] = max(1, int(target_counts.get(role, 0)))
         else:
+            parallelism = self.ensure_parallelism(
+                max_sidecars_per_primary=2,
+                max_new_sidecars=max(2, min(int(max_new_roles or 0), 4)),
+            )
+            if not parallelism.get("ok"):
+                return parallelism
             elastic = self.elastic_plan(
                 max_new_roles=max_new_roles,
                 max_instances_per_role=max_instances_per_role,
@@ -1487,11 +1643,34 @@ class SwarmRuntime:
             )
             if not elastic.get("ok"):
                 return elastic
+            elastic_coordination = elastic.get("coordination") or {}
             recommended = (
-                (elastic.get("coordination") or {})
+                elastic_coordination
                 .get("scale_recommendation", {})
                 .get("recommended_instances", {})
             )
+            wait_routes = {
+                "wait_dependencies",
+                "wait_external",
+                "wait_verification",
+                "wait_graph",
+            }
+            for role in DEFAULT_ROLES:
+                role_nodes = [
+                    node
+                    for node in elastic_coordination.get("task_nodes", [])
+                    if isinstance(node, dict)
+                    and str(node.get("role") or "") == role
+                    and str(node.get("status") or "") not in {
+                        "done", "failed", "cancelled"
+                    }
+                ]
+                if role_nodes and all(
+                    str(node.get("route") or "") in wait_routes
+                    for node in role_nodes
+                ):
+                    immediate_wait_scale_in_roles.add(role)
+
             for role in DEFAULT_ROLES:
                 target_counts[role] = max(
                     0,
@@ -1542,7 +1721,11 @@ class SwarmRuntime:
                     })
                     continue
 
-                if automatic_scaling and grace_seconds > 0:
+                if (
+                    automatic_scaling
+                    and grace_seconds > 0
+                    and role not in immediate_wait_scale_in_roles
+                ):
                     binding = self.store.bindings().get(name)
                     since = (
                         float(binding.get("excess_since") or 0.0)
@@ -1653,6 +1836,7 @@ class SwarmRuntime:
             "scale_in_deferred": scale_in_deferred,
             "scale_in_skipped": scale_in_skipped,
             "scale_in_grace_seconds": grace_seconds,
+            "immediate_wait_scale_in_roles": sorted(immediate_wait_scale_in_roles),
             "max_total_workers": max(1, min(int(max_total_workers or 1), 32)),
             "requested_target_instances": target_counts,
             "previous_worker_instances": current_counts,
@@ -1662,6 +1846,7 @@ class SwarmRuntime:
             "total_web_agents": sum(final_counts.values()) + 1,
             "agents": records,
             "watcher": watcher,
+            "parallelism": parallelism,
             "coordination": self.coordination_plan(max_total_workers=max_total_workers),
         }
 
@@ -1689,15 +1874,44 @@ class SwarmRuntime:
                 "tab": tab,
                 "ui": None,
                 "error": None,
+                "browser_state": (
+                    "discarded"
+                    if bool((tab or {}).get("discarded"))
+                    else (
+                        "frozen"
+                        if bool((tab or {}).get("frozen"))
+                        else "active"
+                    )
+                ),
             }
             if tab:
                 inspected = self.bridge.inspect(int(tab["id"]), tail=tail)
                 if inspected.get("ok"):
                     item["ui"] = inspected.get("snapshot")
+                    inspected_tab = inspected.get("tab")
+                    if isinstance(inspected_tab, dict):
+                        item["tab"] = inspected_tab
+                        item["browser_state"] = (
+                            "discarded"
+                            if bool(inspected_tab.get("discarded"))
+                            else (
+                                "frozen"
+                                if bool(inspected_tab.get("frozen"))
+                                else "active"
+                            )
+                        )
                 else:
                     item["error"] = inspected.get("error")
+                    state_hint = str(inspected.get("browserState") or "").strip()
+                    if state_hint in {"discarded", "frozen", "unresponsive"}:
+                        item["browser_state"] = state_hint
+                    elif "Timed out waiting for extension response" in str(
+                        inspected.get("error") or ""
+                    ):
+                        item["browser_state"] = "unresponsive"
             else:
                 item["error"] = "bound conversation is not currently open"
+                item["browser_state"] = "closed"
             agents.append(item)
 
         coordination = self.coordination_plan()
@@ -1726,6 +1940,13 @@ class SwarmRuntime:
             "bridge": self.bridge.health(),
             "agents": agents,
             "tasks": tasks,
+            "task_steps": [
+                copy.deepcopy(record)
+                for steps in durable.get("task_steps", {}).values()
+                if isinstance(steps, dict)
+                for record in steps.values()
+                if isinstance(record, dict)
+            ],
             "shared_status": self.store.status(),
             "supersteps": self.store.supersteps(include_pending=False),
             "interrupts": self.store.interrupts(),
@@ -1740,8 +1961,29 @@ class SwarmRuntime:
             "canonical_epoch": int(durable.get("canonical_epoch") or 0),
             "canonical_epochs": durable.get("canonical_epochs", {}),
             "coordination": coordination,
+            "liveness": {
+                "browser_suspended_agents": [
+                    {
+                        "name": item.get("name"),
+                        "role": str((item.get("binding") or {}).get("role") or ""),
+                        "browser_state": item.get("browser_state"),
+                        "error": item.get("error"),
+                    }
+                    for item in agents
+                    if item.get("browser_state") in {
+                        "discarded",
+                        "frozen",
+                        "unresponsive",
+                    }
+                ],
+                "semantics": (
+                    "Browser suspended/unresponsive is a transport-liveness condition, "
+                    "not Task completion or safe scale-in evidence."
+                ),
+            },
             "completion_truth": (
-                "Browser idle means only that the page is not generating. "
-                "Use durable task state and real external verification for completion."
+                "Browser idle means only that the page is not generating. Frozen, discarded, "
+                "or unresponsive pages are transport faults, not completion. Use durable task "
+                "state and real external verification for completion."
             ),
         }

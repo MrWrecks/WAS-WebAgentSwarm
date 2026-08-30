@@ -19,6 +19,18 @@ Use `chrome://extensions/` and the same unpacked-extension flow.
 The extension reads only bounded visible state from ChatGPT pages and can insert/send
 messages when instructed by the local bridge.
 
+## Agent-tab lifecycle protection
+
+Every ChatGPT tab observed or created by WAS is automatically marked
+`autoDiscardable=false`, so Chromium/Edge should not automatically discard it
+under memory pressure. Tab metadata also reports `discarded`, `frozen`, and
+`autoDiscardable`. A discarded tab is reloaded before WAS inspects it or sends
+a message.
+
+Browser/OS energy policies may still freeze a minimized/background page. WAS
+treats that as `browser_suspended` transport liveness, not worker completion or
+safe scale-in evidence.
+
 ## Browser-profile behavior
 
 The extension is profile-scoped. WAS controls the Edge/Chrome profile where this unpacked

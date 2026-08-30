@@ -99,6 +99,168 @@ class DurableStoreTest(unittest.TestCase):
                 [{"mapped": 10}, {"mapped": 20}, {"mapped": 30}],
             )
 
+    def test_task_step_fingerprint_tracks_inputs_and_mvcc_versions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DurableStore(Path(tmp))
+            store.task_create(
+                "Fingerprint task",
+                task_id="fingerprint",
+                payload={"mode": "strict"},
+                canonical_root=tmp,
+                resource_hints=["src/a.py"],
+            )
+            first = store.task_step_fingerprint(
+                "fingerprint",
+                "regression",
+                inputs={"command": "pytest"},
+            )
+            again = store.task_step_fingerprint(
+                "fingerprint",
+                "regression",
+                inputs={"command": "pytest"},
+            )
+            self.assertEqual(first["input_fingerprint"], again["input_fingerprint"])
+
+            changed_input = store.task_step_fingerprint(
+                "fingerprint",
+                "regression",
+                inputs={"command": "pytest -q"},
+            )
+            self.assertNotEqual(
+                first["input_fingerprint"],
+                changed_input["input_fingerprint"],
+            )
+
+            canonical_id = first["basis"]["canonical_id"]
+            data = store.load()
+            data["canonical_epochs"][canonical_id] = 1
+            data["resource_versions"][canonical_id + "::src/a.py"] = {
+                "resource": "src/a.py",
+                "canonical_id": canonical_id,
+                "version": 1,
+                "sha256": "deadbeef",
+                "exists": True,
+            }
+            store.save(data)
+            changed_source = store.task_step_fingerprint(
+                "fingerprint",
+                "regression",
+                inputs={"command": "pytest"},
+            )
+            self.assertNotEqual(
+                first["input_fingerprint"],
+                changed_source["input_fingerprint"],
+            )
+            self.assertEqual(changed_source["basis"]["canonical_epoch"], 1)
+            self.assertEqual(
+                changed_source["basis"]["resources"][0]["sha256"],
+                "deadbeef",
+            )
+
+    def test_task_step_cache_reuses_results_and_serializes_same_step(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DurableStore(Path(tmp))
+            store.task_create("Expensive task", task_id="expensive")
+
+            first = store.task_step_acquire(
+                "expensive",
+                "full-regression",
+                "implementer",
+                input_fingerprint="sha256:abc",
+                lease_seconds=60,
+            )
+            self.assertEqual(first["action"], "execute")
+            self.assertEqual(first["record"]["attempts"], 1)
+
+            waiting = store.task_step_acquire(
+                "expensive",
+                "full-regression",
+                "tester",
+                input_fingerprint="sha256:abc",
+                lease_seconds=60,
+            )
+            self.assertEqual(waiting["action"], "wait")
+            self.assertEqual(waiting["record"]["claimed_by"], "implementer")
+
+            beat = store.task_step_heartbeat(
+                "expensive",
+                "full-regression",
+                "implementer",
+                lease_seconds=120,
+            )
+            self.assertGreater(beat["lease_expires_at"], first["record"]["lease_expires_at"])
+
+            done = store.task_step_complete(
+                "expensive",
+                "full-regression",
+                "implementer",
+                status="done",
+                result={"passed": 71},
+                summary="71/71",
+            )
+            self.assertEqual(done["status"], "done")
+
+            reused = store.task_step_acquire(
+                "expensive",
+                "full-regression",
+                "tester",
+                input_fingerprint="sha256:abc",
+            )
+            self.assertEqual(reused["action"], "reuse")
+            self.assertTrue(reused["reusable"])
+            self.assertEqual(reused["record"]["result"], {"passed": 71})
+
+            changed = store.task_step_acquire(
+                "expensive",
+                "full-regression",
+                "tester",
+                input_fingerprint="sha256:def",
+            )
+            self.assertEqual(changed["action"], "execute")
+            self.assertEqual(changed["record"]["generation"], 2)
+            store.task_step_complete(
+                "expensive",
+                "full-regression",
+                "tester",
+                status="failed",
+                error="new input failed",
+            )
+            retry = store.task_step_acquire(
+                "expensive",
+                "full-regression",
+                "reviewer",
+                input_fingerprint="sha256:def",
+            )
+            self.assertEqual(retry["action"], "execute")
+            self.assertEqual(retry["record"]["attempts"], 2)
+
+    def test_task_steps_are_checkpointed_and_restored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DurableStore(Path(tmp))
+            store.task_create("Checkpoint steps", task_id="step-cp")
+            store.task_step_acquire(
+                "step-cp", "download", "researcher", input_fingerprint="v1"
+            )
+            store.task_step_complete(
+                "step-cp", "download", "researcher",
+                result={"artifact": "v1.bin"},
+            )
+            checkpoint = store.checkpoint_create(label="with step result")
+
+            store.task_step_acquire(
+                "step-cp", "download", "researcher", input_fingerprint="v2"
+            )
+            store.task_step_complete(
+                "step-cp", "download", "researcher",
+                result={"artifact": "v2.bin"},
+            )
+            store.checkpoint_restore(checkpoint["checkpoint_id"])
+            reused = store.task_step_acquire(
+                "step-cp", "download", "tester", input_fingerprint="v1"
+            )
+            self.assertEqual(reused["action"], "reuse")
+            self.assertEqual(reused["record"]["result"], {"artifact": "v1.bin"})
+
 
     def test_durable_interrupt_resume_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -159,6 +321,43 @@ class DurableStoreTest(unittest.TestCase):
                 store.checkpoints()[0]["checkpoint_id"],
                 checkpoint["checkpoint_id"],
             )
+
+    def test_checkpoint_lineage_survives_restore_and_branch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DurableStore(Path(tmp))
+            first = store.checkpoint_create(label="first")
+            second = store.checkpoint_create(label="second")
+            third = store.checkpoint_create(label="third")
+
+            self.assertEqual(second["parent_checkpoint_id"], first["checkpoint_id"])
+            self.assertEqual(third["parent_checkpoint_id"], second["checkpoint_id"])
+
+            lineage = store.checkpoint_lineage()
+            self.assertEqual(
+                [item["checkpoint_id"] for item in lineage["lineage"]],
+                [
+                    third["checkpoint_id"],
+                    second["checkpoint_id"],
+                    first["checkpoint_id"],
+                ],
+            )
+            self.assertFalse(lineage["truncated"])
+
+            store.checkpoint_restore(first["checkpoint_id"])
+            branch = store.checkpoint_create(label="branch-from-first")
+            self.assertEqual(branch["parent_checkpoint_id"], first["checkpoint_id"])
+
+            branch_lineage = store.checkpoint_lineage(branch["checkpoint_id"])
+            self.assertEqual(
+                [item["checkpoint_id"] for item in branch_lineage["lineage"]],
+                [branch["checkpoint_id"], first["checkpoint_id"]],
+            )
+            listed = {
+                item["checkpoint_id"]: item
+                for item in store.checkpoints()
+            }
+            self.assertTrue(listed[branch["checkpoint_id"]]["is_head"])
+            self.assertFalse(listed[third["checkpoint_id"]]["is_head"])
 
     def test_checkpoint_restore_invalidates_restored_live_superstep(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,6 +1,7 @@
 """Small durable coordination store. No chat transcript is persisted by default."""
 
 import copy
+import hashlib
 import json
 import os
 import time
@@ -70,9 +71,11 @@ class DurableStore:
 
     def _empty(self) -> Dict[str, object]:
         return {
-            "schema_version": 8,
+            "schema_version": 10,
             "bindings": {},
             "tasks": {},
+            "task_steps": {},
+            "checkpoint_head_id": "",
             "shared_status": {},
             "supersteps": {},
             "interrupts": {},
@@ -355,6 +358,262 @@ class DurableStore:
             key=lambda item: (
                 float(item.get("updated_at") or 0.0),
                 str(item.get("task_id") or ""),
+            ),
+        )
+
+    def task_step_fingerprint(
+        self,
+        task_id: str,
+        step_key: str,
+        inputs: object = None,
+        resource_paths: Optional[List[str]] = None,
+    ) -> Dict[str, object]:
+        """Hash deterministic step inputs together with MVCC resource versions."""
+        clean_task = str(task_id or "").strip()
+        clean_step = str(step_key or "").strip()
+        if not clean_task:
+            raise ValueError("task_id is required")
+        if not clean_step:
+            raise ValueError("step_key is required")
+        # Fail early if caller passes non-durable/non-JSON input state.
+        json.dumps(inputs, ensure_ascii=False, sort_keys=True)
+
+        data = self.load()
+        task = data["tasks"].get(clean_task)
+        if not isinstance(task, dict):
+            raise KeyError("unknown task_id")
+
+        canonical_root = str(task.get("canonical_root") or "").strip()
+        canonical_id = ""
+        if canonical_root:
+            normalized_root = os.path.normcase(
+                str(Path(canonical_root).expanduser().resolve())
+            )
+            canonical_id = (
+                "canon_"
+                + hashlib.sha256(normalized_root.encode("utf-8")).hexdigest()[:16]
+            )
+        paths = resource_paths
+        if paths is None:
+            paths = list(task.get("resource_hints") or [])
+        clean_paths = sorted({
+            str(path or "").strip().replace("\\", "/").strip("/")
+            for path in (paths or [])
+            if str(path or "").strip()
+        })
+
+        resource_state = []
+        for path in clean_paths:
+            version = (
+                data["resource_versions"].get(canonical_id + "::" + path)
+                if canonical_id
+                else None
+            )
+            resource_state.append({
+                "resource": path,
+                "version": int((version or {}).get("version") or 0),
+                "sha256": str((version or {}).get("sha256") or ""),
+                "exists": (
+                    bool(version.get("exists"))
+                    if isinstance(version, dict) and "exists" in version
+                    else None
+                ),
+            })
+
+        basis = {
+            "task_id": clean_task,
+            "step_key": clean_step,
+            "task_payload": copy.deepcopy(task.get("payload")),
+            "canonical_id": canonical_id,
+            "canonical_epoch": int(
+                data.get("canonical_epochs", {}).get(canonical_id) or 0
+            ) if canonical_id else 0,
+            "resources": resource_state,
+            "inputs": inputs,
+        }
+        raw = json.dumps(
+            basis,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        fingerprint = "sha256:" + hashlib.sha256(raw).hexdigest()
+        return {
+            "task_id": clean_task,
+            "step_key": clean_step,
+            "input_fingerprint": fingerprint,
+            "basis": basis,
+        }
+
+    def task_step_acquire(
+        self,
+        task_id: str,
+        step_key: str,
+        worker_name: str,
+        input_fingerprint: str = "",
+        lease_seconds: int = 900,
+    ) -> Dict[str, object]:
+        """Atomically reuse, wait for, resume, or acquire one durable task step."""
+        clean_task = str(task_id or "").strip()
+        clean_step = str(step_key or "").strip()
+        clean_worker = str(worker_name or "").strip()
+        fingerprint = str(input_fingerprint or "").strip()
+        if not clean_task:
+            raise ValueError("task_id is required")
+        if not clean_step:
+            raise ValueError("step_key is required")
+        if len(clean_step) > 256:
+            raise ValueError("step_key is too long")
+        if not clean_worker:
+            raise ValueError("worker_name is required")
+        lease = max(1, min(int(lease_seconds or 1), 86400))
+
+        with self._write_lock():
+            data = self.load()
+            if clean_task not in data["tasks"]:
+                raise KeyError("unknown task_id")
+            steps = data["task_steps"].setdefault(clean_task, {})
+            current = steps.get(clean_step)
+            now = time.time()
+
+            if isinstance(current, dict):
+                same_input = str(current.get("input_fingerprint") or "") == fingerprint
+                status = str(current.get("status") or "")
+                if same_input and status == "done":
+                    return {
+                        "action": "reuse",
+                        "reusable": True,
+                        "record": copy.deepcopy(current),
+                    }
+                if (
+                    same_input
+                    and status == "active"
+                    and float(current.get("lease_expires_at") or 0.0) > now
+                ):
+                    owner = str(current.get("claimed_by") or "")
+                    if owner != clean_worker:
+                        return {
+                            "action": "wait",
+                            "reusable": False,
+                            "record": copy.deepcopy(current),
+                        }
+                    current["lease_expires_at"] = now + lease
+                    current["updated_at"] = now
+                    self.save(data)
+                    return {
+                        "action": "resume",
+                        "reusable": False,
+                        "record": copy.deepcopy(current),
+                    }
+                generation = int(current.get("generation") or 1)
+                attempts = int(current.get("attempts") or 0)
+                if not same_input:
+                    generation += 1
+                    attempts = 0
+            else:
+                generation = 1
+                attempts = 0
+
+            record = {
+                "task_id": clean_task,
+                "step_key": clean_step,
+                "input_fingerprint": fingerprint,
+                "generation": generation,
+                "status": "active",
+                "claimed_by": clean_worker,
+                "lease_expires_at": now + lease,
+                "attempts": attempts + 1,
+                "result": None,
+                "summary": "",
+                "error": "",
+                "started_at": now,
+                "updated_at": now,
+            }
+            steps[clean_step] = record
+            self.save(data)
+            return {
+                "action": "execute",
+                "reusable": False,
+                "record": copy.deepcopy(record),
+            }
+
+    def task_step_heartbeat(
+        self,
+        task_id: str,
+        step_key: str,
+        worker_name: str,
+        lease_seconds: int = 900,
+    ) -> Dict[str, object]:
+        clean_task = str(task_id or "").strip()
+        clean_step = str(step_key or "").strip()
+        clean_worker = str(worker_name or "").strip()
+        lease = max(1, min(int(lease_seconds or 1), 86400))
+        with self._write_lock():
+            data = self.load()
+            record = (data["task_steps"].get(clean_task) or {}).get(clean_step)
+            if not isinstance(record, dict):
+                raise KeyError("unknown task step")
+            if str(record.get("status") or "") != "active":
+                raise RuntimeError("task step is not active")
+            if str(record.get("claimed_by") or "") != clean_worker:
+                raise RuntimeError("task step is owned by another worker")
+            now = time.time()
+            record["lease_expires_at"] = now + lease
+            record["updated_at"] = now
+            self.save(data)
+            return copy.deepcopy(record)
+
+    def task_step_complete(
+        self,
+        task_id: str,
+        step_key: str,
+        worker_name: str,
+        status: str = "done",
+        result: object = None,
+        summary: str = "",
+        error: str = "",
+    ) -> Dict[str, object]:
+        clean_task = str(task_id or "").strip()
+        clean_step = str(step_key or "").strip()
+        clean_worker = str(worker_name or "").strip()
+        clean_status = str(status or "done").strip().lower()
+        if clean_status not in {"done", "failed"}:
+            raise ValueError("task step status must be done or failed")
+        with self._write_lock():
+            data = self.load()
+            record = (data["task_steps"].get(clean_task) or {}).get(clean_step)
+            if not isinstance(record, dict):
+                raise KeyError("unknown task step")
+            if str(record.get("status") or "") != "active":
+                raise RuntimeError("task step is not active")
+            if str(record.get("claimed_by") or "") != clean_worker:
+                raise RuntimeError("task step is owned by another worker")
+            now = time.time()
+            record["status"] = clean_status
+            record["result"] = result
+            record["summary"] = str(summary or "").strip()
+            record["error"] = str(error or "").strip()
+            record["claimed_by"] = ""
+            record["lease_expires_at"] = 0.0
+            record["completed_at"] = now
+            record["updated_at"] = now
+            self.save(data)
+            return copy.deepcopy(record)
+
+    def task_steps(self, task_id: str) -> List[Dict[str, object]]:
+        clean_task = str(task_id or "").strip()
+        if not clean_task:
+            raise ValueError("task_id is required")
+        values = (self.load()["task_steps"].get(clean_task) or {}).values()
+        return sorted(
+            [
+                copy.deepcopy(item)
+                for item in values
+                if isinstance(item, dict)
+            ],
+            key=lambda item: (
+                str(item.get("step_key") or ""),
+                int(item.get("generation") or 0),
             ),
         )
 
@@ -1835,6 +2094,7 @@ class DurableStore:
         label: str = "",
         metadata: Optional[Dict[str, object]] = None,
         retain: int = 20,
+        parent_checkpoint_id: str = "",
     ) -> Dict[str, object]:
         """Persist a bounded coordination-state checkpoint for recovery/time-travel."""
         json.dumps(metadata or {}, ensure_ascii=False)
@@ -1843,8 +2103,25 @@ class DurableStore:
             data = self.load()
             checkpoint_id = "cp_" + uuid.uuid4().hex[:10]
             now = time.time()
+            clean_parent = str(parent_checkpoint_id or "").strip()
+            if clean_parent:
+                if clean_parent not in data["checkpoints"]:
+                    raise KeyError("unknown parent_checkpoint_id")
+            else:
+                head = str(data.get("checkpoint_head_id") or "").strip()
+                if head in data["checkpoints"]:
+                    clean_parent = head
+                elif data["checkpoints"]:
+                    clean_parent = str(max(
+                        data["checkpoints"].values(),
+                        key=lambda item: (
+                            float(item.get("created_at") or 0.0),
+                            str(item.get("checkpoint_id") or ""),
+                        ),
+                    ).get("checkpoint_id") or "")
             snapshot = {
                 "tasks": copy.deepcopy(data["tasks"]),
+                "task_steps": copy.deepcopy(data["task_steps"]),
                 "shared_status": copy.deepcopy(data["shared_status"]),
                 "supersteps": copy.deepcopy(data["supersteps"]),
                 "interrupts": copy.deepcopy(data["interrupts"]),
@@ -1853,12 +2130,14 @@ class DurableStore:
             }
             record = {
                 "checkpoint_id": checkpoint_id,
+                "parent_checkpoint_id": clean_parent,
                 "label": str(label or "").strip(),
                 "metadata": dict(metadata or {}),
                 "created_at": now,
                 "snapshot": snapshot,
             }
             data["checkpoints"][checkpoint_id] = record
+            data["checkpoint_head_id"] = checkpoint_id
             ordered = sorted(
                 data["checkpoints"].values(),
                 key=lambda item: float(item.get("created_at") or 0.0),
@@ -1869,23 +2148,74 @@ class DurableStore:
             self.save(data)
             return {
                 "checkpoint_id": checkpoint_id,
+                "parent_checkpoint_id": clean_parent,
                 "label": record["label"],
                 "metadata": copy.deepcopy(record["metadata"]),
                 "created_at": now,
             }
 
     def checkpoints(self) -> List[Dict[str, object]]:
+        data = self.load()
+        head_id = str(data.get("checkpoint_head_id") or "")
         values = []
-        for record in self.load()["checkpoints"].values():
+        for record in data["checkpoints"].values():
             if not isinstance(record, dict):
                 continue
+            checkpoint_id = str(record.get("checkpoint_id") or "")
             values.append({
-                "checkpoint_id": str(record.get("checkpoint_id") or ""),
+                "checkpoint_id": checkpoint_id,
+                "parent_checkpoint_id": str(record.get("parent_checkpoint_id") or ""),
+                "is_head": checkpoint_id == head_id,
                 "label": str(record.get("label") or ""),
                 "metadata": copy.deepcopy(record.get("metadata") or {}),
                 "created_at": float(record.get("created_at") or 0.0),
             })
         return sorted(values, key=lambda item: (item["created_at"], item["checkpoint_id"]))
+
+    def checkpoint_lineage(self, checkpoint_id: str = "") -> Dict[str, object]:
+        data = self.load()
+        clean_id = str(checkpoint_id or data.get("checkpoint_head_id") or "").strip()
+        if not clean_id:
+            return {
+                "checkpoint_id": "",
+                "head_checkpoint_id": str(data.get("checkpoint_head_id") or ""),
+                "lineage": [],
+                "truncated": False,
+            }
+        if clean_id not in data["checkpoints"]:
+            raise KeyError("unknown checkpoint_id")
+
+        lineage = []
+        seen = set()
+        cursor = clean_id
+        truncated = False
+        while cursor:
+            if cursor in seen:
+                truncated = True
+                break
+            seen.add(cursor)
+            record = data["checkpoints"].get(cursor)
+            if not isinstance(record, dict):
+                truncated = True
+                break
+            lineage.append({
+                "checkpoint_id": cursor,
+                "parent_checkpoint_id": str(record.get("parent_checkpoint_id") or ""),
+                "label": str(record.get("label") or ""),
+                "created_at": float(record.get("created_at") or 0.0),
+            })
+            parent = str(record.get("parent_checkpoint_id") or "")
+            if parent and parent not in data["checkpoints"]:
+                truncated = True
+                break
+            cursor = parent
+
+        return {
+            "checkpoint_id": clean_id,
+            "head_checkpoint_id": str(data.get("checkpoint_head_id") or ""),
+            "lineage": lineage,
+            "truncated": truncated,
+        }
 
     def checkpoint_restore(self, checkpoint_id: str) -> Dict[str, object]:
         """Restore durable coordination state while preserving browser bindings/checkpoint history."""
@@ -1907,17 +2237,27 @@ class DurableStore:
                 for step in data["supersteps"].values()
                 if isinstance(step, dict) and step.get("status") in {"open", "ready"}
             ]
+            active_task_steps = [
+                "{0}:{1}".format(task_id, step_key)
+                for task_id, steps in data["task_steps"].items()
+                if isinstance(steps, dict)
+                for step_key, record in steps.items()
+                if isinstance(record, dict)
+                and str(record.get("status") or "") == "active"
+                and float(record.get("lease_expires_at") or 0.0) > now
+            ]
             live_lanes = [
                 str(lane.get("lane_id") or "")
                 for lane in data["lanes"].values()
                 if isinstance(lane, dict)
                 and lane.get("status") in {"creating", "active", "committing", "recovery_required"}
             ]
-            if active_leases or active_steps or live_lanes:
+            if active_leases or active_steps or active_task_steps or live_lanes:
                 raise RuntimeError(
-                    "cannot restore while active leases/supersteps/MVCC lanes exist: "
-                    "leases={0}, supersteps={1}, lanes={2}".format(
+                    "cannot restore while active leases/task-steps/supersteps/MVCC lanes exist: "
+                    "leases={0}, task_steps={1}, supersteps={2}, lanes={3}".format(
                         ",".join(active_leases) or "none",
+                        ",".join(active_task_steps) or "none",
                         ",".join(active_steps) or "none",
                         ",".join(live_lanes) or "none",
                     )
@@ -1931,6 +2271,10 @@ class DurableStore:
                 if not isinstance(value, dict):
                     raise RuntimeError("checkpoint is missing valid {0}".format(key))
                 data[key] = copy.deepcopy(value)
+            task_steps_value = snapshot.get("task_steps", {})
+            if not isinstance(task_steps_value, dict):
+                raise RuntimeError("checkpoint has invalid task_steps")
+            data["task_steps"] = copy.deepcopy(task_steps_value)
             graph_value = snapshot.get("graphs", {})
             if not isinstance(graph_value, dict):
                 raise RuntimeError("checkpoint is missing valid graphs")
@@ -1961,9 +2305,12 @@ class DurableStore:
                 if str(task.get("superstep_id") or "") in recovered_steps:
                     task["superstep_id"] = ""
                     task["updated_at"] = now
+            data["checkpoint_head_id"] = clean_id
             self.save(data)
             return {
                 "checkpoint_id": clean_id,
+                "parent_checkpoint_id": str(record.get("parent_checkpoint_id") or ""),
+                "head_checkpoint_id": clean_id,
                 "label": str(record.get("label") or ""),
                 "restored": True,
                 "restored_at": now,

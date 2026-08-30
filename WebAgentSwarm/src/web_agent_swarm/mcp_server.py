@@ -7,6 +7,7 @@ except ImportError as exc:
         'FastMCP is not installed. Run: pip install -e ".[mcp]"'
     ) from exc
 
+from .benchmark import benchmark_history, run_scheduler_benchmark
 from .bridge import BridgeClient
 from .mvcc import LaneManager
 from .state import DurableStore
@@ -18,6 +19,24 @@ bridge = BridgeClient()
 store = DurableStore()
 lanes = LaneManager(store)
 swarm = SwarmRuntime(bridge=bridge, store=store)
+
+
+@mcp.tool
+def web_agent_swarm_benchmark(
+    record: bool = False,
+    journal_path: str = "",
+):
+    """Run deterministic scheduler episodes and optionally record a reproducibility study."""
+    return run_scheduler_benchmark(record=record, journal_path=journal_path)
+
+
+@mcp.tool
+def web_agent_swarm_benchmark_history(
+    limit: int = 20,
+    journal_path: str = "",
+):
+    """List recent local scheduler benchmark studies."""
+    return benchmark_history(limit=limit, journal_path=journal_path)
 
 
 @mcp.tool
@@ -89,6 +108,18 @@ def web_agent_swarm_coordination_plan(
         max_new_roles=max_new_roles,
         max_instances_per_role=max_instances_per_role,
         max_total_workers=max_total_workers,
+    )
+
+
+@mcp.tool
+def web_agent_swarm_ensure_parallelism(
+    max_sidecars_per_primary: int = 2,
+    max_new_sidecars: int = 4,
+):
+    """Materialize bounded safe JIT sidecars for runnable primary tasks."""
+    return swarm.ensure_parallelism(
+        max_sidecars_per_primary=max_sidecars_per_primary,
+        max_new_sidecars=max_new_sidecars,
     )
 
 
@@ -515,6 +546,84 @@ def swarm_task_assist_list(parent_task_id: str, include_terminal: bool = True):
 
 
 @mcp.tool
+def swarm_task_step_fingerprint(
+    task_id: str,
+    step_key: str,
+    inputs: object = None,
+    resource_paths: list = None,
+):
+    """Hash step inputs together with current MVCC resource versions."""
+    return store.task_step_fingerprint(
+        task_id,
+        step_key,
+        inputs=inputs,
+        resource_paths=resource_paths,
+    )
+
+
+@mcp.tool
+def swarm_task_step_acquire(
+    task_id: str,
+    step_key: str,
+    worker_name: str,
+    input_fingerprint: str = "",
+    lease_seconds: int = 900,
+):
+    """Acquire or reuse an idempotent durable step inside a task."""
+    return store.task_step_acquire(
+        task_id,
+        step_key,
+        worker_name,
+        input_fingerprint=input_fingerprint,
+        lease_seconds=lease_seconds,
+    )
+
+
+@mcp.tool
+def swarm_task_step_heartbeat(
+    task_id: str,
+    step_key: str,
+    worker_name: str,
+    lease_seconds: int = 900,
+):
+    """Renew one active durable task-step lease."""
+    return store.task_step_heartbeat(
+        task_id,
+        step_key,
+        worker_name,
+        lease_seconds=lease_seconds,
+    )
+
+
+@mcp.tool
+def swarm_task_step_complete(
+    task_id: str,
+    step_key: str,
+    worker_name: str,
+    status: str = "done",
+    result: object = None,
+    summary: str = "",
+    error: str = "",
+):
+    """Complete/fail one durable task step so future resumes can reuse it."""
+    return store.task_step_complete(
+        task_id,
+        step_key,
+        worker_name,
+        status=status,
+        result=result,
+        summary=summary,
+        error=error,
+    )
+
+
+@mcp.tool
+def swarm_task_step_list(task_id: str):
+    """List durable step results for one task."""
+    return {"task_id": task_id, "steps": store.task_steps(task_id)}
+
+
+@mcp.tool
 def swarm_task_claim(
     task_id: str,
     worker_name: str,
@@ -665,15 +774,27 @@ def swarm_checkpoint_create(
     label: str = "",
     metadata: dict = None,
     retain: int = 20,
+    parent_checkpoint_id: str = "",
 ):
-    """Create a bounded coordination checkpoint for fault recovery/time-travel."""
-    return store.checkpoint_create(label=label, metadata=metadata, retain=retain)
+    """Create a bounded coordination checkpoint with explicit ancestry."""
+    return store.checkpoint_create(
+        label=label,
+        metadata=metadata,
+        retain=retain,
+        parent_checkpoint_id=parent_checkpoint_id,
+    )
 
 
 @mcp.tool
 def swarm_checkpoint_list():
     """List coordination checkpoints without returning their full state snapshots."""
     return store.checkpoints()
+
+
+@mcp.tool
+def swarm_checkpoint_lineage(checkpoint_id: str = ""):
+    """Return checkpoint ancestry from one checkpoint (or the current head) backwards."""
+    return store.checkpoint_lineage(checkpoint_id)
 
 
 @mcp.tool
