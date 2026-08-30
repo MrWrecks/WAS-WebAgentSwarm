@@ -7,7 +7,11 @@ import time
 from typing import Any
 
 from .swarm import SwarmRuntime
-from .watchdogs import BrowserLifecycleWatchdog, collect_snapshot_alerts
+from .watchdogs import (
+    BrowserLifecycleWatchdog,
+    collect_snapshot_alerts,
+    conversation_limit_reached,
+)
 
 
 TICK = (
@@ -320,7 +324,11 @@ def _main_idle(snapshot: dict) -> bool:
         ui = item.get("ui") or {}
         if item.get("error") and not ui:
             return False
-        return bool(item.get("open")) and not bool(ui.get("generating"))
+        return (
+            bool(item.get("open"))
+            and not bool(ui.get("generating"))
+            and bool(ui.get("sendButtonEnabled", True))
+        )
     return False
 
 
@@ -340,6 +348,27 @@ def run(interval: float = 300.0, max_silence: float = 300.0, once: bool = False)
         )
         _scale_out_productive_work(runtime)
         snapshot = _watch_snapshot(runtime)
+
+        main_item = next(
+            (
+                item
+                for item in snapshot.get("agents", [])
+                if isinstance(item, dict) and item.get("name") == "main"
+            ),
+            {},
+        )
+        if conversation_limit_reached(main_item.get("ui")):
+            rollover = runtime.rollover_main_if_exhausted()
+            if rollover.get("rolled_over"):
+                snapshot = _watch_snapshot(runtime)
+                pending = True
+                last_digest = None
+            elif once:
+                return 3
+            else:
+                time.sleep(max(2.0, float(interval)))
+                continue
+
         digest = _digest(snapshot)
         if last_digest is None or digest != last_digest:
             pending = True

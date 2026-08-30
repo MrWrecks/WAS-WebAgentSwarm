@@ -2053,6 +2053,108 @@ class SwarmRuntime:
         result["name"] = str(name)
         return result
 
+    def rollover_main_if_exhausted(self) -> Dict[str, object]:
+        """Replace an exhausted main ChatGPT conversation without mutating durable work."""
+        from .watchdogs import conversation_limit_reached
+
+        old_binding = self.store.bindings().get("main")
+        old_tab = self._resolve("main")
+        if not isinstance(old_binding, dict) or not old_tab:
+            return {
+                "ok": False,
+                "rolled_over": False,
+                "error": "main binding is unavailable",
+            }
+
+        inspected = self.bridge.inspect(int(old_tab["id"]), tail=3)
+        if not inspected.get("ok"):
+            return {
+                "ok": False,
+                "rolled_over": False,
+                "error": inspected.get("error") or "main inspect failed",
+            }
+        if not conversation_limit_reached(inspected.get("snapshot") or {}):
+            return {
+                "ok": True,
+                "rolled_over": False,
+                "reason": "conversation_not_exhausted",
+            }
+
+        active_roles = self._bound_worker_roles()
+        old_url = str(old_tab.get("url") or old_binding.get("url_at_bind") or "")
+        target = (
+            old_url.split("/c/", 1)[0]
+            if old_url.startswith("https://chatgpt.com/") and "/c/" in old_url
+            else self._spawn_url(self._tabs())
+        )
+        if not target.startswith("https://chatgpt.com/"):
+            target = "https://chatgpt.com/"
+
+        opened = self.bridge.open_tab(target, active=False)
+        new_tab = opened.get("tab") if opened.get("ok") else None
+        if not new_tab:
+            return {
+                "ok": False,
+                "rolled_over": False,
+                "error": opened.get("error") or "failed to open fresh main tab",
+            }
+
+        prompt = (
+            "The watcher created this fresh main conversation because the previous main "
+            "reached ChatGPT's conversation-length limit. Do not depend on old chat memory; "
+            "treat the durable WebAgentSwarm store/graph as coordination truth and resume from it. "
+            + self._main_prompt(active_roles)
+        )
+        sent = self._send_when_ready(int(new_tab["id"]), prompt, timeout=10.0)
+        if not sent.get("ok"):
+            try:
+                self.bridge.close_tab(int(new_tab["id"]))
+            except Exception:
+                pass
+            return {
+                "ok": False,
+                "rolled_over": False,
+                "error": sent.get("error") or "failed to bootstrap fresh main conversation",
+            }
+
+        stable = self._wait_conversation(int(new_tab["id"]), timeout=60.0)
+        if not stable:
+            try:
+                self.bridge.close_tab(int(new_tab["id"]))
+            except Exception:
+                pass
+            return {
+                "ok": False,
+                "rolled_over": False,
+                "error": "fresh main conversation URL did not stabilize",
+            }
+
+        old_conversation_id = str(old_binding.get("conversation_id") or "")
+        self._bind("main", stable, "main", "")
+        current = self.store.bindings().get("main") or {}
+        updated = dict(current)
+        updated["rollover_count"] = int(old_binding.get("rollover_count") or 0) + 1
+        updated["rollover_from_conversation_id"] = old_conversation_id
+        updated["rolled_over_at"] = time.time()
+        self.store.bind("main", updated)
+
+        try:
+            closed = self.bridge.close_tab(int(old_tab["id"]))
+        except Exception as exc:
+            closed = {"ok": False, "error": str(exc)}
+
+        return {
+            "ok": True,
+            "rolled_over": True,
+            "old_tab_id": int(old_tab["id"]),
+            "new_tab": stable,
+            "old_conversation_id": old_conversation_id,
+            "new_conversation_id": conversation_id(str(stable.get("url") or "")),
+            "active_roles": active_roles,
+            "old_tab_closed": bool(closed.get("ok")),
+            "close_error": None if closed.get("ok") else closed.get("error"),
+        }
+
     def snapshot(self, tail: int = 4) -> Dict[str, object]:
         bindings = self.store.bindings()
         agents = []
@@ -2126,6 +2228,16 @@ class SwarmRuntime:
             tasks.append(item)
 
         durable = self.store.load()
+        from .watchdogs import conversation_limit_reached
+        conversation_limit_agents = [
+            {
+                "name": item.get("name"),
+                "role": str((item.get("binding") or {}).get("role") or ""),
+                "browser_state": item.get("browser_state"),
+            }
+            for item in agents
+            if conversation_limit_reached(item.get("ui"))
+        ]
         return {
             "ok": True,
             "bridge": self.bridge.health(),
@@ -2153,6 +2265,10 @@ class SwarmRuntime:
             "canonical_epochs": durable.get("canonical_epochs", {}),
             "coordination": coordination,
             "liveness": {
+                "needs_main_rollover": any(
+                    item.get("name") == "main" for item in conversation_limit_agents
+                ),
+                "conversation_limit_agents": conversation_limit_agents,
                 "browser_suspended_agents": [
                     {
                         "name": item.get("name"),

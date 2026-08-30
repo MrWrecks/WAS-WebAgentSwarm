@@ -14,6 +14,7 @@ when worker state changes.
 - Reserve declared task  /  before dispatch so obvious write collisions park as ; MVCC remains the final publication boundary.
 - Inspect bounded visible UI state: idle/generating, recent visible messages, and browser lifecycle state.
 - Protect managed ChatGPT Agent tabs with `autoDiscardable=false`; detect `discarded/frozen/unresponsive` tabs and treat them as transport faults rather than completion.
+- Detect main-conversation length exhaustion, stop ordinary ticks to that tab, open a fresh main conversation in the same connected browser context, rebind main, and resume from durable WAS state before closing the exhausted tab.
 - Send an exact message to an exact ChatGPT tab or stable conversation binding.
 - Keep a small durable task board and shared status store outside chat history.
 - Recommend a worker count/role subset before opening browser tabs.

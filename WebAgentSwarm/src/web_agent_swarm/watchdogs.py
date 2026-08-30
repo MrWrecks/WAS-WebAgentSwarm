@@ -8,6 +8,57 @@ durable task state or browser tabs.
 from typing import Dict, List
 
 
+_CONVERSATION_LIMIT_MARKERS = (
+    "你已达到此对话的长度上限",
+    "达到此对话的长度上限",
+    "开始新聊天以继续对话",
+    "you've reached the maximum length for this conversation",
+    "you have reached the maximum length for this conversation",
+    "reached the maximum length for this conversation",
+    "start a new chat to continue",
+)
+
+
+def conversation_limit_reached(ui: object) -> bool:
+    if not isinstance(ui, dict):
+        return False
+    if bool(ui.get("conversationLimitReached")):
+        return True
+    texts = [
+        str(ui.get("lastAssistantText") or ""),
+        str(ui.get("lastUserText") or ""),
+    ]
+    for item in ui.get("messages", []) or []:
+        if isinstance(item, dict):
+            texts.append(str(item.get("text") or ""))
+    haystack = "\n".join(texts).lower()
+    return any(marker in haystack for marker in _CONVERSATION_LIMIT_MARKERS)
+
+
+class MainConversationLimitWatchdog:
+    name = "main_conversation_limit"
+
+    @classmethod
+    def scan(cls, snapshot: dict) -> List[Dict[str, object]]:
+        alerts = []
+        for item in snapshot.get("agents", []):
+            if item.get("name") != "main":
+                continue
+            if not conversation_limit_reached(item.get("ui")):
+                continue
+            alerts.append({
+                "name": "main",
+                "kind": "main_conversation_limit",
+                "watchdog": cls.name,
+                "browser_state": str(item.get("browser_state") or "").strip(),
+                "error": (
+                    "Main ChatGPT conversation reached its length limit and cannot "
+                    "receive further orchestration ticks."
+                ),
+            })
+        return alerts
+
+
 class BrowserSuspensionWatchdog:
     name = "browser_suspension"
 
@@ -109,6 +160,7 @@ class BrowserLifecycleWatchdog:
 
 
 SNAPSHOT_WATCHDOGS = (
+    MainConversationLimitWatchdog,
     BrowserSuspensionWatchdog,
     InspectErrorWatchdog,
     GeneratingStallWatchdog,

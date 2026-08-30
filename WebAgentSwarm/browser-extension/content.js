@@ -62,13 +62,24 @@
       visibleText.includes('Connection interrupted') ||
       visibleText.includes('waiting for a complete response')
     );
+    const conversationLimitReached = (
+      visibleText.includes('你已达到此对话的长度上限') ||
+      visibleText.includes('达到此对话的长度上限') ||
+      visibleText.includes('开始新聊天以继续对话') ||
+      visibleText.includes("You've reached the maximum length for this conversation") ||
+      visibleText.includes('You have reached the maximum length for this conversation') ||
+      visibleText.includes('start a new chat to continue')
+    );
 
     return {
       title: document.title,
       url: location.href,
-      uiState: busy ? 'generating' : 'idle',
+      uiState: conversationLimitReached
+        ? 'conversation_limit'
+        : (busy ? 'generating' : 'idle'),
       generating: busy,
       connectionInterrupted,
+      conversationLimitReached,
       stuckGenerating: Boolean(busy && connectionInterrupted),
       composerPresent: Boolean(composer()),
       sendButtonEnabled: Boolean(sendButton() && !sendButton().disabled),

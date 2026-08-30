@@ -9,6 +9,7 @@ from web_agent_swarm.watcher import (
     _transport_alerts,
     _watch_snapshot,
 )
+from web_agent_swarm.watchdogs import conversation_limit_reached
 
 
 class WatcherSemanticsTest(unittest.TestCase):
@@ -131,6 +132,31 @@ class WatcherSemanticsTest(unittest.TestCase):
         self.assertEqual(alerts[0]["kind"], "browser_suspended")
         self.assertEqual(alerts[0]["browser_state"], "unresponsive")
         self.assertTrue(_has_unresolved_work(suspended))
+
+    def test_main_conversation_limit_is_transport_semantic(self):
+        snapshot = self._snapshot()
+        ui = {
+            "generating": False,
+            "sendButtonEnabled": False,
+            "lastAssistantText": (
+                "You have reached the maximum length for this conversation. "
+                "Start a new chat to continue."
+            ),
+            "messages": [],
+        }
+        snapshot["agents"][0]["ui"] = ui
+        self.assertTrue(conversation_limit_reached(ui))
+        alerts = _transport_alerts(snapshot)
+        self.assertEqual(alerts[0]["kind"], "main_conversation_limit")
+        self.assertFalse(_main_idle(snapshot))
+
+    def test_disabled_main_send_button_is_not_idle_send_target(self):
+        snapshot = self._snapshot()
+        snapshot["agents"][0]["ui"] = {
+            "generating": False,
+            "sendButtonEnabled": False,
+        }
+        self.assertFalse(_main_idle(snapshot))
 
     def test_suspended_main_is_not_treated_as_idle_send_target(self):
         snapshot = self._snapshot()

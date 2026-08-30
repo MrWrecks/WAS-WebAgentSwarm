@@ -44,10 +44,17 @@ sequence-numbered browser lifecycle event ring, so the watcher can long-poll for
 changes and wake before the fixed polling interval. Fixed polling remains the fallback for durable
 state and bridge compatibility.
 
-Transport detection is split into observation-only watchdogs
-(`BrowserSuspensionWatchdog`, `InspectErrorWatchdog`,
-`GeneratingStallWatchdog`, and `BrowserLifecycleWatchdog`). They never mutate task ownership
+Transport detection is split into observation-only watchdogs:
+MainConversationLimitWatchdog, BrowserSuspensionWatchdog, InspectErrorWatchdog,
+GeneratingStallWatchdog, and BrowserLifecycleWatchdog. They never mutate task ownership
 or publish canonical state.
+
+A main-conversation length limit is a transport exhaustion condition, not durable completion.
+The watcher does not send another ordinary tick when the main send path is disabled. It opens
+a fresh ChatGPT conversation in the same connected browser context, bootstraps the main orchestrator
+to re-read durable WAS state and graph, waits for a stable conversation binding, rebinds main,
+records rollover lineage, and only then closes the exhausted tab. Task leases, checkpoints, graph
+state, interrupts, MVCC lanes, and other durable coordination state are not rewritten by rollover.
 
 ### Bundled MCP servers
 
