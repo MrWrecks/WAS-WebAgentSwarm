@@ -133,6 +133,30 @@ class WatcherSemanticsTest(unittest.TestCase):
         self.assertEqual(alerts[0]["browser_state"], "unresponsive")
         self.assertTrue(_has_unresolved_work(suspended))
 
+    def test_send_ack_timeout_is_transport_semantic_and_may_have_executed(self):
+        snapshot = self._snapshot()
+        snapshot["agents"][1]["binding"]["send_health"] = {
+            "last_ok": False,
+            "ack_timeout": True,
+            "may_have_executed": True,
+            "last_command_id": "cmd-worker",
+            "last_error": "Timed out waiting for extension response.",
+            "consecutive_failures": 1,
+        }
+        alerts = _transport_alerts(snapshot)
+        self.assertEqual(alerts[0]["kind"], "send_ack_timeout")
+        self.assertTrue(alerts[0]["may_have_executed"])
+        self.assertEqual(alerts[0]["command_id"], "cmd-worker")
+
+    def test_chatgpt_request_failure_is_transport_semantic(self):
+        snapshot = self._snapshot({
+            "generating": False,
+            "uiState": "idle",
+            "requestFailed": True,
+        })
+        alerts = _transport_alerts(snapshot)
+        self.assertEqual(alerts[0]["kind"], "chatgpt_request_failed")
+
     def test_main_conversation_limit_is_transport_semantic(self):
         snapshot = self._snapshot()
         ui = {
@@ -150,13 +174,15 @@ class WatcherSemanticsTest(unittest.TestCase):
         self.assertEqual(alerts[0]["kind"], "main_conversation_limit")
         self.assertFalse(_main_idle(snapshot))
 
-    def test_disabled_main_send_button_is_not_idle_send_target(self):
+    def test_empty_composer_with_disabled_send_button_is_still_idle_send_target(self):
         snapshot = self._snapshot()
         snapshot["agents"][0]["ui"] = {
             "generating": False,
+            "composerPresent": True,
             "sendButtonEnabled": False,
+            "conversationLimitReached": False,
         }
-        self.assertFalse(_main_idle(snapshot))
+        self.assertTrue(_main_idle(snapshot))
 
     def test_suspended_main_is_not_treated_as_idle_send_target(self):
         snapshot = self._snapshot()

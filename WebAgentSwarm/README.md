@@ -71,6 +71,28 @@ CodexPro Lite local development tools
 (workspace/search/read/write/edit/background/handoff/context)
 ```
 
+## Portable runtime model — native filesystem first
+
+WAS is intentionally **not** tied to WSL, UNC paths, a specific Windows account, or a
+particular Linux distribution. Run each process in the filesystem namespace where its
+workspace actually lives:
+
+```text
+Windows repository   -> run Python/Node on Windows -> <native-windows-workspace>
+Linux repository     -> run Python/Node on Linux   -> $HOME/<workspace>
+macOS repository     -> run Python/Node on macOS   -> $HOME/<workspace>
+WSL repository       -> run Python/Node in WSL     -> $HOME/<workspace>
+```
+
+For WSL, prefer a native Linux workspace under `$HOME`. Do **not** make a Windows UNC alias
+for that Linux directory the default MCP/workspace root. If the browser is on Windows and the
+WAS runtime is in WSL, communicate with the browser bridge over localhost HTTP/WebSocket;
+file access remains native inside WSL. UNC/network workspaces are an explicit operator choice,
+not a WAS requirement or default.
+
+All machine-specific paths belong in local environment/configuration, never in the repository.
+The release check rejects common user-home, WSL UNC, distro-name, and private-hostname leaks.
+
 ## Quick start
 
 1. Install Node.js 20+ and Python 3.10+.

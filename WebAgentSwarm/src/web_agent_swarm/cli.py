@@ -2,6 +2,9 @@
 
 import argparse
 import json
+import platform
+import shutil
+import sys
 
 from .benchmark import benchmark_history, run_scheduler_benchmark
 from .bridge import BridgeClient
@@ -30,6 +33,7 @@ def main(argv=None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("health")
+    sub.add_parser("doctor")
     sub.add_parser("tabs")
     sub.add_parser("snapshot")
     benchmark = sub.add_parser("benchmark")
@@ -106,6 +110,36 @@ def main(argv=None) -> int:
 
     if args.command == "health":
         emit(bridge.health())
+    elif args.command == "doctor":
+        bridge_health = bridge.health()
+        state_health = store.diagnostics()
+        checks = {
+            "python": {"ok": sys.version_info >= (3, 10), "version": platform.python_version()},
+            "node": {"ok": bool(shutil.which("node")), "path": shutil.which("node") or ""},
+            "bridge": bridge_health,
+            "durable_state": state_health,
+            "bridge_token": {"ok": bool(bridge.token), "configured": bool(bridge.token), "path": str(bridge.token_file)},
+            "protocol": {
+                "ok": bool(bridge_health.get("protocol_compatible")),
+                "bridge_min": int(bridge_health.get("protocolMin") or bridge_health.get("protocolVersion") or 0),
+                "bridge_max": int(bridge_health.get("protocolMax") or bridge_health.get("protocolVersion") or 0),
+            },
+            "extension": {
+                "ok": int(bridge_health.get("extensionClients") or 0) == 1,
+                "clients": int(bridge_health.get("extensionClients") or 0),
+                "versions": list(bridge_health.get("extensionVersions") or []),
+            },
+        }
+        emit({
+            "ok": all(bool(item.get("ok")) for item in checks.values()),
+            "checks": checks,
+            "recovery": [
+                "Start the localhost bridge if bridge.ok is false.",
+                "Open the extension options and paste the bridge token if bridge_token.ok is false.",
+                "Reload/update the extension when protocol.ok is false.",
+                "Inspect the durable-state backup/quarantine files when durable_state.ok is false.",
+            ],
+        })
     elif args.command == "tabs":
         emit(bridge.tabs())
     elif args.command == "snapshot":

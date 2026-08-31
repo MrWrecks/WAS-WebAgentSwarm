@@ -2041,16 +2041,84 @@ class SwarmRuntime:
             "coordination": self.coordination_plan(max_total_workers=max_total_workers),
         }
 
+    def _record_send_health(
+        self,
+        name: str,
+        result: Dict[str, object],
+        elapsed_seconds: float,
+    ) -> Dict[str, object]:
+        clean_name = str(name)
+        binding = self.store.bindings().get(clean_name)
+        if not isinstance(binding, dict):
+            return {}
+        updated = dict(binding)
+        previous = updated.get("send_health")
+        previous = previous if isinstance(previous, dict) else {}
+        ok = bool(result.get("ok"))
+        error = str(result.get("error") or "")
+        http_status = int(result.get("http_status") or 0)
+        ack_timeout = (
+            http_status == 504
+            or "Timed out waiting for extension response" in error
+            or "bridge unavailable" in error.lower()
+            or "timed out" in error.lower()
+        )
+        health = {
+            "last_attempt_at": time.time(),
+            "last_ok": ok,
+            "consecutive_failures": (
+                0 if ok else int(previous.get("consecutive_failures") or 0) + 1
+            ),
+            "last_error": "" if ok else error,
+            "last_http_status": http_status,
+            "last_command_id": str(result.get("command_id") or ""),
+            "last_attempts": int(result.get("attempts") or 0),
+            "last_latency_ms": int(max(0.0, elapsed_seconds) * 1000),
+            "ack_timeout": bool(ack_timeout),
+            "may_have_executed": bool(ack_timeout),
+        }
+        updated["send_health"] = health
+        self.store.bind(clean_name, updated)
+        return health
+
     def send(self, name: str, text: str) -> Dict[str, object]:
-        tab = self._resolve(str(name))
+        clean_name = str(name)
+        tab = self._resolve(clean_name)
         if not tab:
             return {"ok": False, "error": "bound conversation is not open"}
+        command_id = uuid.uuid4().hex
+        self.store.send_transaction_record(
+            command_id,
+            name=clean_name,
+            tab_id=int(tab["id"]),
+            status="attempting",
+        )
+        started = time.monotonic()
         result = self._send_when_ready(
             int(tab["id"]),
             text,
-            timeout=10.0,
+            timeout=24.0,
+            command_id=command_id,
         )
-        result["name"] = str(name)
+        result["name"] = clean_name
+        result["send_health"] = self._record_send_health(
+            clean_name, result, time.monotonic() - started
+        )
+        health = result["send_health"]
+        status = (
+            "ok" if result.get("ok")
+            else "busy" if result.get("busy")
+            else "ack_timeout" if health.get("ack_timeout")
+            else "failed"
+        )
+        result["send_transaction"] = self.store.send_transaction_record(
+            command_id,
+            name=clean_name,
+            tab_id=int(tab["id"]),
+            status=status,
+            result=result,
+            may_have_executed=bool(health.get("may_have_executed")),
+        )
         return result
 
     def rollover_main_if_exhausted(self) -> Dict[str, object]:

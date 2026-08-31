@@ -49,7 +49,7 @@ class BridgeClientTest(unittest.TestCase):
             "/send",
             method="POST",
             payload={"tabId": 7, "text": "continue", "commandId": "cmd-123"},
-            timeout=9.0,
+            timeout=14.0,
         )
 
     def test_close_tab_uses_bridge_close_endpoint(self):
@@ -86,6 +86,17 @@ class BridgeClientTest(unittest.TestCase):
             "current_connected_browser_profile_only",
         )
         self.assertIn("will not launch another Edge/Chrome profile", result["recovery"])
+
+    def test_bridge_token_is_lazily_reloaded(self):
+        client = BridgeClient("http://example.invalid", token="")
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"ok": true}'
+        with mock.patch("web_agent_swarm.bridge.load_bridge_token", return_value="x" * 64), mock.patch("web_agent_swarm.bridge.request.urlopen", return_value=response) as opened:
+            result = client._json("/health")
+        self.assertTrue(result["ok"])
+        self.assertEqual(client.token, "x" * 64)
+        request_object = opened.call_args.args[0]
+        self.assertEqual(request_object.get_header("X-was-token"), "x" * 64)
 
 
 if __name__ == "__main__":

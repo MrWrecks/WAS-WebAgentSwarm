@@ -5,16 +5,22 @@
   <title>Web Agent Swarm Bridge Options</title>
   <style>
     body { font: 14px system-ui, sans-serif; max-width: 720px; margin: 32px auto; padding: 0 16px; }
-    input { width: 100%; box-sizing: border-box; padding: 8px; }
-    button { margin-top: 12px; padding: 8px 14px; }
+    input { width: 100%; box-sizing: border-box; padding: 8px; margin: 6px 0 14px; }
+    button { margin-top: 4px; padding: 8px 14px; }
     #status { margin-left: 8px; }
+    code { overflow-wrap: anywhere; }
   </style>
 </head>
 <body>
   <h1>Web Agent Swarm Bridge</h1>
   <label for="ws">Bridge WebSocket URL</label>
-  <input id="ws" value="ws://127.0.0.1:8788/ws">
+  <input id="ws" value="ws://127.0.0.1:8788/ws" autocomplete="off">
+
+  <label for="token">Bridge token</label>
+  <input id="token" type="password" autocomplete="off" placeholder="Paste the bridge token">
+
   <button id="save">Save</button><span id="status"></span>
+  <p>The bridge is authenticated even on loopback. Copy the token from the WAS bridge token file generated during setup.</p>
   <p>Keep the bridge bound to loopback unless you understand the security implications.</p>
   <script src="options.js"></script>
 </body>

@@ -7,7 +7,10 @@ development work:
 python -m web_agent_swarm.codexpro_server
 ```
 
-Set `CODEXPRO_ROOT` to the workspace that the agent is allowed to operate on.
+Set `CODEXPRO_ROOT` to the workspace that the agent is allowed to operate on. Prefer the
+native path of the operating environment running this MCP server (for example `$HOME/<workspace>`
+inside WSL/Linux, not a Windows UNC alias for that same directory). No WSL distribution name or
+UNC path is required by CodexPro Lite.
 
 ## Included action surface
 

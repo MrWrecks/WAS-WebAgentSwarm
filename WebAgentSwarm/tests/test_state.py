@@ -606,6 +606,32 @@ class DurableStoreTest(unittest.TestCase):
             self.assertEqual(result["status"], "conflict")
             self.assertIn("conflicting pending writes", result["error"])
             self.assertNotIn("shared", store.status())
+    def test_state_schema_migration_corruption_recovery_and_send_ledger(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = DurableStore(root)
+            legacy = {"schema_version": 11, "bindings": {}, "tasks": {}}
+            store.path.write_text(json.dumps(legacy), encoding="utf-8")
+            loaded = store.load()
+            self.assertEqual(loaded["schema_version"], 12)
+            self.assertEqual(loaded["send_transactions"], {})
+
+            tx = store.send_transaction_record("cmd-1", name="main", tab_id=7, status="attempting")
+            self.assertEqual(tx["status"], "attempting")
+            final = store.send_transaction_record(
+                "cmd-1", name="main", tab_id=7, status="ack_timeout",
+                result={"ok": False}, may_have_executed=True,
+            )
+            self.assertTrue(final["may_have_executed"])
+            self.assertEqual(store.send_transaction_get("cmd-1")["status"], "ack_timeout")
+
+            store.save(store.load())
+            store.path.write_text("{broken", encoding="utf-8")
+            recovered = store.load()
+            self.assertEqual(recovered["schema_version"], 12)
+            self.assertTrue(any(root.glob("state.corrupt.*.json")))
+
 
 if __name__ == "__main__":
     unittest.main()

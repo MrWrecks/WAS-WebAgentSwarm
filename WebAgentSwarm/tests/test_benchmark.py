@@ -18,7 +18,7 @@ class SchedulerBenchmarkTest(unittest.TestCase):
         self.assertEqual(result["passed_count"], 7)
         self.assertEqual(result["total_reward"], 7)
         self.assertTrue(all(item["passed"] for item in result["episodes"]))
-        self.assertEqual(result["was_version"], "0.5.1")
+        self.assertEqual(result["was_version"], "0.6.0")
         self.assertEqual(len(result["scheduler_source_hash"]), 64)
 
     def test_benchmark_journal_round_trip(self):

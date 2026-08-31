@@ -17,6 +17,10 @@ MACHINE_PATH_PATTERNS = [
     re.compile(r"[A-Za-z]:\\Users\\[^\\\s]+"),
     re.compile(r"/Users/[^/\s]+"),
     re.compile(r"/home/[^/\s]+"),
+    re.compile(r"(?i)\\\\wsl(?:\.localhost|\$)?\\"),
+    re.compile(r"(?i)wsl\.localhost"),
+    re.compile(r"(?i)WSL_[A-Za-z0-9_.-]+"),
+    re.compile(r"(?i)[A-Za-z0-9-]+\.(?:ts\.net|tailnet-[A-Za-z0-9.-]+)"),
 ]
 
 issues = []

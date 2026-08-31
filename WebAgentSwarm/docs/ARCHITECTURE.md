@@ -1,5 +1,22 @@
 # Architecture
 
+## Filesystem/transport separation
+
+WAS treats the **workspace filesystem** and the **browser transport** as separate concerns.
+The workspace is resolved natively by the Python/CodexPro Lite process (`CODEXPRO_ROOT` or its
+current working directory). Browser control uses the loopback bridge (`WEB_SWARM_BRIDGE_URL`).
+Neither layer derives a workspace path from the other.
+
+Consequently, WSL is only one optional deployment environment:
+
+```text
+workspace filesystem:  $HOME/<workspace>         (native runtime path)
+browser transport:     http://127.0.0.1:8788     (HTTP/WebSocket)
+```
+
+There is no required UNC hop. Windows, Linux, and macOS hosts follow
+the same rule: local workspace path + loopback browser transport.
+
 ## Components
 
 ### Browser extension

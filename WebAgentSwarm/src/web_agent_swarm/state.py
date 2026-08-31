@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import os
+import shutil
 import time
 import uuid
 from contextlib import contextmanager
@@ -38,6 +39,20 @@ ASSIST_KINDS = {
 }
 ASSIST_WRITE_POLICIES = {"readonly", "experiment_only", "disjoint_write", "proposal_only"}
 
+CURRENT_SCHEMA_VERSION = 12
+
+
+class DurableStateError(RuntimeError):
+    """Base class for durable-state load/recovery failures."""
+
+
+class DurableStateCorruptionError(DurableStateError):
+    """Raised when neither primary nor backup durable state can be trusted."""
+
+
+class DurableStateVersionError(DurableStateError):
+    """Raised when state was written by a newer incompatible WAS version."""
+
 
 def default_state_dir() -> Path:
     configured = os.environ.get("WEB_SWARM_STATE_DIR")
@@ -50,6 +65,9 @@ class DurableStore:
     def __init__(self, root: Optional[Path] = None) -> None:
         self.root = (root or default_state_dir()).resolve()
         self.path = self.root / "state.json"
+        self.backup_path = self.root / "state.json.bak"
+        self.checksum_path = self.root / "state.json.sha256"
+        self.backup_checksum_path = self.root / "state.json.bak.sha256"
         self.lock_path = self.root / "state.lock"
 
     @contextmanager
@@ -89,7 +107,7 @@ class DurableStore:
 
     def _empty(self) -> Dict[str, object]:
         return {
-            "schema_version": 11,
+            "schema_version": CURRENT_SCHEMA_VERSION,
             "bindings": {},
             "tasks": {},
             "task_steps": {},
@@ -108,17 +126,128 @@ class DurableStore:
             "commits": {},
             "canonical_epoch": 0,
             "canonical_epochs": {},
+            "send_transactions": {},
         }
 
-    def load(self) -> Dict[str, object]:
-        if not self.path.is_file():
-            return self._empty()
+    @staticmethod
+    def _sha256_bytes(payload: bytes) -> str:
+        return hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _read_checksum(path: Path) -> str:
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return self._empty()
+            return path.read_text(encoding="ascii").strip().lower()
+        except OSError:
+            return ""
+
+    def _read_state_file(self, path: Path, checksum_path: Path) -> Dict[str, object]:
+        payload = path.read_bytes()
+        expected = self._read_checksum(checksum_path)
+        if expected and expected != self._sha256_bytes(payload):
+            raise DurableStateCorruptionError(
+                "checksum mismatch for {0}".format(path.name)
+            )
+        try:
+            data = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise DurableStateCorruptionError(
+                "invalid JSON in {0}".format(path.name)
+            ) from exc
         if not isinstance(data, dict):
-            return self._empty()
+            raise DurableStateCorruptionError(
+                "durable state root must be an object: {0}".format(path.name)
+            )
+        return data
+
+    @staticmethod
+    def _atomic_write(path: Path, payload: bytes) -> None:
+        tmp = path.with_name(path.name + ".tmp")
+        with tmp.open("wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(tmp), str(path))
+
+    def _write_checksum(self, path: Path, payload: bytes) -> None:
+        digest = (self._sha256_bytes(payload) + "\n").encode("ascii")
+        self._atomic_write(path, digest)
+
+    def _quarantine_primary(self) -> Optional[Path]:
+        if not self.path.exists():
+            return None
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        target = self.root / ("state.corrupt.{0}.json".format(stamp))
+        suffix = 1
+        while target.exists():
+            target = self.root / (
+                "state.corrupt.{0}.{1}.json".format(stamp, suffix)
+            )
+            suffix += 1
+        os.replace(str(self.path), str(target))
+        if self.checksum_path.exists():
+            try:
+                os.replace(
+                    str(self.checksum_path),
+                    str(target.with_suffix(target.suffix + ".sha256")),
+                )
+            except OSError:
+                pass
+        return target
+
+    def _restore_backup(self) -> Dict[str, object]:
+        data = self._read_state_file(self.backup_path, self.backup_checksum_path)
+        payload = self.backup_path.read_bytes()
+        self._quarantine_primary()
+        self._atomic_write(self.path, payload)
+        self._write_checksum(self.checksum_path, payload)
+        return data
+
+    @staticmethod
+    def _migrate_step(data: Dict[str, object], source_version: int) -> Dict[str, object]:
+        migrated = copy.deepcopy(data)
+        target_version = source_version + 1
+        if target_version == 9:
+            migrated.setdefault("graphs", {})
+            migrated.setdefault("active_graph_id", "")
+        elif target_version == 10:
+            migrated.setdefault("task_steps", {})
+            migrated.setdefault("checkpoints", {})
+            migrated.setdefault("checkpoint_head_id", "")
+            migrated.setdefault("interrupts", {})
+            migrated.setdefault("supersteps", {})
+        elif target_version == 11:
+            migrated.setdefault("runs", {})
+            migrated.setdefault("lanes", {})
+            migrated.setdefault("resource_claims", {})
+            migrated.setdefault("resource_versions", {})
+            migrated.setdefault("commits", {})
+            migrated.setdefault("canonical_epoch", 0)
+            migrated.setdefault("canonical_epochs", {})
+        elif target_version == 12:
+            migrated.setdefault("send_transactions", {})
+        migrated["schema_version"] = target_version
+        return migrated
+
+    def _migrate(self, data: Dict[str, object]) -> Dict[str, object]:
+        raw_version = data.get("schema_version", 1)
+        if isinstance(raw_version, bool) or not isinstance(raw_version, int):
+            raise DurableStateVersionError("schema_version must be an integer")
+        if raw_version < 1:
+            raise DurableStateVersionError("schema_version must be positive")
+        if raw_version > CURRENT_SCHEMA_VERSION:
+            raise DurableStateVersionError(
+                "durable state schema {0} is newer than supported schema {1}".format(
+                    raw_version, CURRENT_SCHEMA_VERSION
+                )
+            )
+        migrated = copy.deepcopy(data)
+        version = raw_version
+        while version < CURRENT_SCHEMA_VERSION:
+            migrated = self._migrate_step(migrated, version)
+            version += 1
+        return migrated
+
+    def _normalize(self, data: Dict[str, object]) -> Dict[str, object]:
         base = self._empty()
         for key in base:
             if key == "schema_version":
@@ -149,7 +278,10 @@ class DurableStore:
                 task.setdefault("assist_write_policy", "")
                 task.setdefault("resource_hints", [])
                 task.setdefault("canonical_root", "")
-                task.setdefault("preferred_role", str(task.get("owner") or "").strip().lower())
+                task.setdefault(
+                    "preferred_role",
+                    str(task.get("owner") or "").strip().lower(),
+                )
                 task["required_capabilities"] = normalize_capabilities(
                     task.get("required_capabilities") or []
                 )
@@ -173,16 +305,123 @@ class DurableStore:
             graph.setdefault("updated_at", 0.0)
         if base["active_graph_id"] and base["active_graph_id"] not in base["graphs"]:
             base["active_graph_id"] = ""
+        base["schema_version"] = CURRENT_SCHEMA_VERSION
         return base
+
+    def load(self) -> Dict[str, object]:
+        if not self.path.is_file():
+            return self._empty()
+        try:
+            data = self._read_state_file(self.path, self.checksum_path)
+        except (OSError, DurableStateCorruptionError) as primary_error:
+            try:
+                data = self._restore_backup()
+            except (OSError, DurableStateCorruptionError) as backup_error:
+                raise DurableStateCorruptionError(
+                    "durable state is corrupt and no valid backup is available: "
+                    "primary={0}; backup={1}".format(primary_error, backup_error)
+                ) from primary_error
+        return self._normalize(self._migrate(data))
 
     def save(self, data: Dict[str, object]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(str(tmp), str(self.path))
+        normalized = copy.deepcopy(data)
+        normalized["schema_version"] = CURRENT_SCHEMA_VERSION
+        payload = (
+            json.dumps(normalized, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+
+        if self.path.is_file():
+            try:
+                self._read_state_file(self.path, self.checksum_path)
+                previous = self.path.read_bytes()
+                self._atomic_write(self.backup_path, previous)
+                self._write_checksum(self.backup_checksum_path, previous)
+            except (OSError, DurableStateCorruptionError):
+                # Never replace a known-good backup with an untrusted primary.
+                pass
+
+        self._atomic_write(self.path, payload)
+        self._write_checksum(self.checksum_path, payload)
+
+    def diagnostics(self) -> Dict[str, object]:
+        result = {
+            "ok": True,
+            "state_path": str(self.path),
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "primary_exists": self.path.is_file(),
+            "backup_exists": self.backup_path.is_file(),
+            "checksum_present": self.checksum_path.is_file(),
+            "error": "",
+        }
+        try:
+            loaded = self.load()
+            result["loaded_schema_version"] = int(
+                loaded.get("schema_version") or CURRENT_SCHEMA_VERSION
+            )
+            result["task_count"] = len(loaded.get("tasks") or {})
+            result["binding_count"] = len(loaded.get("bindings") or {})
+        except DurableStateError as exc:
+            result["ok"] = False
+            result["error"] = str(exc)
+        return result
+
+    def send_transaction_record(
+        self,
+        command_id: str,
+        *,
+        name: str = "",
+        tab_id: int = 0,
+        status: str = "attempting",
+        result: Optional[Dict[str, object]] = None,
+        may_have_executed: bool = False,
+    ) -> Dict[str, object]:
+        clean = str(command_id or "").strip()[:128]
+        if not clean:
+            raise ValueError("command_id is required")
+        clean_status = str(status or "attempting").strip().lower()
+        if clean_status not in {"attempting", "ok", "failed", "ack_timeout", "busy"}:
+            raise ValueError("unsupported send transaction status")
+        with self._write_lock():
+            data = self.load()
+            ledger = data["send_transactions"]
+            previous = ledger.get(clean)
+            previous = previous if isinstance(previous, dict) else {}
+            now = time.time()
+            record = {
+                "command_id": clean,
+                "name": str(name or previous.get("name") or ""),
+                "tab_id": int(tab_id or previous.get("tab_id") or 0),
+                "status": clean_status,
+                "created_at": float(previous.get("created_at") or now),
+                "updated_at": now,
+                "may_have_executed": bool(may_have_executed),
+                "result": copy.deepcopy(result) if isinstance(result, dict) else copy.deepcopy(previous.get("result")),
+            }
+            ledger[clean] = record
+            if len(ledger) > 512:
+                ordered = sorted(
+                    ledger.items(),
+                    key=lambda item: float((item[1] or {}).get("updated_at") or 0.0),
+                )
+                for key, _ in ordered[:-512]:
+                    ledger.pop(key, None)
+            self.save(data)
+            return copy.deepcopy(record)
+
+    def send_transaction_get(self, command_id: str) -> Optional[Dict[str, object]]:
+        clean = str(command_id or "").strip()[:128]
+        record = self.load()["send_transactions"].get(clean)
+        return copy.deepcopy(record) if isinstance(record, dict) else None
+
+    def send_transactions(self, limit: int = 100) -> List[Dict[str, object]]:
+        values = [
+            copy.deepcopy(item)
+            for item in self.load()["send_transactions"].values()
+            if isinstance(item, dict)
+        ]
+        values.sort(key=lambda item: float(item.get("updated_at") or 0.0), reverse=True)
+        return values[:max(1, min(int(limit or 100), 512))]
 
     def bind(self, name: str, binding: Dict[str, object]) -> Dict[str, object]:
         with self._write_lock():

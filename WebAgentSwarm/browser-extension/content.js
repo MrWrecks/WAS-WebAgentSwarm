@@ -62,6 +62,20 @@
       visibleText.includes('Connection interrupted') ||
       visibleText.includes('waiting for a complete response')
     );
+    const retryActionPresent = Array.from(document.querySelectorAll('button')).some(button => {
+      const label = String(
+        button.innerText || button.textContent || button.getAttribute('aria-label') || ''
+      ).trim().toLowerCase();
+      return label === '重试' || label === 'retry' || label.includes('retry');
+    });
+    const requestFailed = Boolean(
+      !busy && retryActionPresent && (
+        visibleText.includes('消息发送超时') ||
+        visibleText.includes('请重试') ||
+        visibleText.includes('Message send timed out') ||
+        visibleText.includes('Please retry')
+      )
+    );
     const conversationLimitReached = (
       visibleText.includes('你已达到此对话的长度上限') ||
       visibleText.includes('达到此对话的长度上限') ||
@@ -79,6 +93,8 @@
         : (busy ? 'generating' : 'idle'),
       generating: busy,
       connectionInterrupted,
+      requestFailed,
+      retryActionPresent,
       conversationLimitReached,
       stuckGenerating: Boolean(busy && connectionInterrupted),
       composerPresent: Boolean(composer()),

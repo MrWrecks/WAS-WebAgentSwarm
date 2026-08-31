@@ -32,7 +32,9 @@ TICK = (
     "A pending excess_since worker is capacity maintenance work and may need a later scale tick. "
     "Use swarm_checkpoint_create before risky coordination rewrites; restore only when no live "
     "lease or open superstep exists. Never scale merely because a browser tab is idle, never "
-    "duplicate a valid lease, and send only a real durable next action."
+    "duplicate a valid lease. A send ACK timeout may have executed: reconcile command_id with "
+    "the target tab's lastUserText/lastRole/generating state before any resend. Send only a real "
+    "durable next action."
 )
 
 
@@ -133,11 +135,21 @@ def _watch_snapshot(runtime: SwarmRuntime) -> dict:
         main_item["error"] = "bound conversation is not currently open"
     agents.append(main_item)
 
+    raw_tasks = runtime.store.tasks()
+    now = time.time()
+    active_owners = {
+        str(task.get("claimed_by") or "")
+        for task in raw_tasks
+        if isinstance(task, dict)
+        and str(task.get("status") or "").lower() == "active"
+        and str(task.get("claimed_by") or "")
+        and float(task.get("lease_expires_at") or 0.0) > now
+    }
     for name in sorted(bindings):
         if name == "main":
             continue
         binding = bindings[name]
-        agents.append({
+        worker = {
             "name": name,
             "binding": binding,
             "open": None,
@@ -145,7 +157,31 @@ def _watch_snapshot(runtime: SwarmRuntime) -> dict:
             "ui": None,
             "error": None,
             "browser_state": "unknown",
-        })
+        }
+        if name in active_owners and not bool((binding or {}).get("suspended")):
+            tab = runtime._resolve(name)
+            worker["open"] = bool(tab)
+            worker["tab"] = tab
+            if tab:
+                inspected = runtime.bridge.inspect(int(tab["id"]), tail=1)
+                if inspected.get("ok"):
+                    worker["ui"] = inspected.get("snapshot")
+                    worker["browser_state"] = "active"
+                else:
+                    worker["error"] = inspected.get("error")
+                    hint = str(inspected.get("browserState") or "").strip()
+                    worker["browser_state"] = (
+                        hint if hint in {"discarded", "frozen", "unresponsive"}
+                        else (
+                            "unresponsive"
+                            if "Timed out waiting for extension response" in str(inspected.get("error") or "")
+                            else "active"
+                        )
+                    )
+            else:
+                worker["browser_state"] = "closed"
+                worker["error"] = "bound conversation is not currently open"
+        agents.append(worker)
 
     coordination = runtime.coordination_plan()
     kind_by_task = {
@@ -159,7 +195,7 @@ def _watch_snapshot(runtime: SwarmRuntime) -> dict:
         if isinstance(node, dict)
     }
     tasks = []
-    for task in runtime.store.tasks():
+    for task in raw_tasks:
         item = dict(task)
         task_id = str(item.get("task_id") or "")
         if str(item.get("status") or "").lower() == "blocked":
@@ -327,7 +363,8 @@ def _main_idle(snapshot: dict) -> bool:
         return (
             bool(item.get("open"))
             and not bool(ui.get("generating"))
-            and bool(ui.get("sendButtonEnabled", True))
+            and bool(ui.get("composerPresent", True))
+            and not conversation_limit_reached(ui)
         )
     return False
 

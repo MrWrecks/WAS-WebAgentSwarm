@@ -716,6 +716,27 @@ class SwarmRuntimeTest(unittest.TestCase):
                 {"tester", "reviewer"},
             )
 
+    def test_send_persists_command_transaction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = FakeBridge()
+            store = DurableStore(Path(tmp))
+            swarm = SwarmRuntime(bridge=bridge, store=store)
+            bridge.tabs_data = [{
+                "id": 7, "windowId": 1, "index": 0, "title": "Worker",
+                "url": "https://chatgpt.com/c/worker", "active": False,
+            }]
+            store.bind("implementer", {
+                "kind": "worker", "role": "implementer",
+                "conversation_id": "worker",
+                "url_at_bind": "https://chatgpt.com/c/worker",
+            })
+            result = swarm.send("implementer", "continue")
+            self.assertTrue(result["ok"])
+            tx = result["send_transaction"]
+            self.assertEqual(tx["status"], "ok")
+            self.assertEqual(tx["command_id"], result["command_id"])
+            self.assertEqual(store.send_transaction_get(result["command_id"])["status"], "ok")
+
 
 if __name__ == "__main__":
     unittest.main()

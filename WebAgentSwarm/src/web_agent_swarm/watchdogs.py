@@ -132,6 +132,50 @@ class GeneratingStallWatchdog:
         return alerts
 
 
+class SendTransactionWatchdog:
+    name = "send_transaction"
+
+    @classmethod
+    def scan(cls, snapshot: dict) -> List[Dict[str, object]]:
+        alerts = []
+        for item in snapshot.get("agents", []):
+            binding = item.get("binding") or {}
+            health = binding.get("send_health") if isinstance(binding, dict) else None
+            if not isinstance(health, dict) or health.get("last_ok") is not False:
+                continue
+            ack_timeout = bool(health.get("ack_timeout"))
+            alerts.append({
+                "name": item.get("name"),
+                "kind": "send_ack_timeout" if ack_timeout else "send_transaction_failed",
+                "watchdog": cls.name,
+                "error": str(health.get("last_error") or ""),
+                "command_id": str(health.get("last_command_id") or ""),
+                "consecutive_failures": int(health.get("consecutive_failures") or 0),
+                "may_have_executed": bool(health.get("may_have_executed")),
+            })
+        return alerts
+
+
+class RequestFailureWatchdog:
+    name = "chatgpt_request_failure"
+
+    @classmethod
+    def scan(cls, snapshot: dict) -> List[Dict[str, object]]:
+        alerts = []
+        for item in snapshot.get("agents", []):
+            ui = item.get("ui") or {}
+            if not isinstance(ui, dict) or not ui.get("requestFailed"):
+                continue
+            alerts.append({
+                "name": item.get("name"),
+                "kind": "chatgpt_request_failed",
+                "watchdog": cls.name,
+                "browser_state": str(item.get("browser_state") or "").strip(),
+                "error": "ChatGPT UI exposes a retryable request failure.",
+            })
+        return alerts
+
+
 class BrowserLifecycleWatchdog:
     name = "browser_lifecycle"
 
@@ -164,6 +208,8 @@ SNAPSHOT_WATCHDOGS = (
     BrowserSuspensionWatchdog,
     InspectErrorWatchdog,
     GeneratingStallWatchdog,
+    SendTransactionWatchdog,
+    RequestFailureWatchdog,
 )
 
 

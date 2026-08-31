@@ -2,18 +2,48 @@
 
 import json
 import os
+from pathlib import Path
 from typing import Dict, Optional
 from urllib import error, parse, request
 
 
+BRIDGE_PROTOCOL_MIN = 5
+BRIDGE_PROTOCOL_MAX = 5
+
+
+def default_bridge_token_file() -> Path:
+    configured = os.environ.get("WEB_SWARM_BRIDGE_TOKEN_FILE")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return (Path.home() / ".web-agent-swarm" / "bridge-token").resolve()
+
+
+def load_bridge_token() -> str:
+    configured = str(os.environ.get("WEB_SWARM_BRIDGE_TOKEN") or "").strip()
+    if configured:
+        return configured
+    path = default_bridge_token_file()
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 class BridgeClient:
-    def __init__(self, base_url: Optional[str] = None, timeout: float = 4.0) -> None:
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        timeout: float = 4.0,
+        token: Optional[str] = None,
+    ) -> None:
         self.base_url = (
             base_url
             or os.environ.get("WEB_SWARM_BRIDGE_URL")
             or "http://127.0.0.1:8788"
         ).rstrip("/")
         self.timeout = max(0.2, float(timeout))
+        self.token_file = default_bridge_token_file()
+        self.token = str(token if token is not None else load_bridge_token()).strip()
 
     def _json(
         self,
@@ -23,7 +53,11 @@ class BridgeClient:
         timeout: Optional[float] = None,
     ) -> Dict[str, object]:
         data = None
+        if not self.token:
+            self.token = load_bridge_token()
         headers = {"Accept": "application/json"}
+        if self.token:
+            headers["X-WAS-Token"] = self.token
         if payload is not None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             headers["Content-Type"] = "application/json"
@@ -42,6 +76,11 @@ class BridgeClient:
                     "error": "bridge returned non-object JSON",
                 }
         except error.HTTPError as exc:
+            if exc.code == 401:
+                refreshed = load_bridge_token()
+                if refreshed and refreshed != self.token:
+                    self.token = refreshed
+                    return self._json(path, method=method, payload=payload, timeout=timeout)
             try:
                 body = json.loads(exc.read().decode("utf-8") or "{}")
                 if isinstance(body, dict):
@@ -57,6 +96,17 @@ class BridgeClient:
     def health(self) -> Dict[str, object]:
         result = self._json("/health", timeout=1.5)
         result["base_url"] = self.base_url
+        result["token_configured"] = bool(self.token)
+        result["token_file"] = str(self.token_file)
+        if result.get("ok"):
+            bridge_min = int(result.get("protocolMin") or result.get("protocolVersion") or 0)
+            bridge_max = int(result.get("protocolMax") or result.get("protocolVersion") or 0)
+            result["protocol_compatible"] = (
+                bridge_max >= BRIDGE_PROTOCOL_MIN
+                and bridge_min <= BRIDGE_PROTOCOL_MAX
+            )
+        else:
+            result["protocol_compatible"] = False
         return result
 
     def tabs(self) -> Dict[str, object]:
@@ -116,6 +166,13 @@ class BridgeClient:
             timeout=9.0,
         )
 
+    def command_status(self, command_id: str) -> Dict[str, object]:
+        clean = str(command_id or "").strip()[:128]
+        if not clean:
+            return {"ok": False, "error": "command_id is required"}
+        query = parse.urlencode({"commandId": clean})
+        return self._json("/command?" + query, timeout=7.0)
+
     def send(
         self,
         tab_id: int,
@@ -133,5 +190,5 @@ class BridgeClient:
             "/send",
             method="POST",
             payload=payload,
-            timeout=9.0,
+            timeout=14.0,
         )

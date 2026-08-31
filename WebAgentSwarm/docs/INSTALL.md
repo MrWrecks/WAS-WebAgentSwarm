@@ -1,5 +1,25 @@
 # End-to-end installation
 
+## Runtime placement and workspace paths
+
+Use the native filesystem of the runtime that owns the workspace. WAS does not require or
+recommend a UNC workspace layer.
+
+| Workspace lives in | Run WAS/CodexPro Lite in | Example workspace root |
+| --- | --- | --- |
+| Windows | Windows | `<native-windows-workspace>` |
+| Linux | Linux | `$HOME/<workspace>` |
+| macOS | macOS | `$HOME/<workspace>` |
+| WSL2 | that WSL distribution | `$HOME/<workspace>` |
+
+If ChatGPT is open in a Windows browser while the runtime is in WSL2, keep source operations
+in WSL and use localhost HTTP/WebSocket for the bridge. `WEB_SWARM_BRIDGE_URL` configures that
+transport; it does not require filesystem sharing. Avoid setting `CODEXPRO_ROOT` to a Windows UNC alias of a WSL directory unless you
+explicitly want Windows-hosted file semantics.
+
+The repository contains no user-specific home directory, WSL distribution name, UNC root,
+Tailscale hostname, browser profile path, or authentication material.
+
 ## Requirements
 
 - Edge or Chrome
@@ -45,6 +65,7 @@ Activate the environment using the normal command for your operating system.
 
 ```bash
 web-agent-swarm health
+web-agent-swarm doctor
 web-agent-swarm tabs
 ```
 
@@ -108,3 +129,7 @@ jobs, change review, handoff, and context management.
 
 See `integrations/codexpro/README.md` for the supported action surface and the differences
 from any private/full CodexPro deployment.
+
+## Optional service installation
+
+Linux/systemd user: `scripts/install-service.sh`. Windows Scheduled Tasks: `scripts\\install-service.ps1`. Both use current-user paths and do not require UNC or administrator-specific roots.
