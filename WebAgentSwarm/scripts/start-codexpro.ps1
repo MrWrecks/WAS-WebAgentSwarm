@@ -1,7 +1,11 @@
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
-$Python = Join-Path $Root ".venv\Scripts\python.exe"
-if (-not (Test-Path $Python)) {
-    throw "Virtual environment not found. Run scripts\setup.ps1 first."
+$CodexPro = Join-Path $Root ".runtime\codexpro"
+$Launcher = Join-Path $CodexPro "scripts\codexpro.mjs"
+$HttpBuild = Join-Path $CodexPro "dist\http.js"
+$StdioBuild = Join-Path $CodexPro "dist\stdio.js"
+if (-not (Test-Path $HttpBuild) -or -not (Test-Path $StdioBuild)) {
+    throw "CodexPro is not prepared. Run scripts\setup-codexpro.ps1 first."
 }
-& $Python -m web_agent_swarm.codexpro_server
+& node $Launcher @args
+exit $LASTEXITCODE

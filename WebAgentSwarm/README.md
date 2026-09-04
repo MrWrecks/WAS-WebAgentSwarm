@@ -103,13 +103,261 @@ The release check rejects common user-home, WSL UNC, distro-name, and private-ho
    `pip install -e ".[mcp]"`
 6. Run:
    `web-agent-swarm health`
-7. Add the two bundled MCP servers to your MCP-capable host using `examples/mcp-config.example.json`.
+7. Build the vendored CodexPro with `scripts/setup-codexpro.sh` (or the PowerShell equivalent), then use `examples/mcp-config.example.json` for local STDIO hosts or the ChatGPT Web guide below for Funnel.
 8. Tell the controller something natural like “open a swarm”. It should call the read-only
    plan tool first and start only after confirmation. With no explicit roles, startup opens only
    the main Web Agent; that main agent reads the durable graph and creates the initial worker
    topology itself. Pass explicit roles/instances only when you want to pin the initial topology.
 
 See `docs/INSTALL.md` and `docs/ARCHITECTURE.md`.
+
+## Install and connect from ChatGPT Web
+
+WAS vendors the **complete CodexPro 0.30.0 Git-tracked source tree** as the single archive
+`integrations/codexpro/codexpro-0.30.0-src.tar.gz`. The Python `CodexPro Lite` compatibility layer has been
+removed; the Node/TypeScript CodexPro implementation is authoritative.
+
+Keep all examples machine-neutral. Replace placeholders locally and never commit account
+names, private hostnames, tokens, user-home paths, or device identifiers.
+
+### 1. Install WAS
+
+Requirements:
+
+- Python 3.10+
+- Node.js 20+
+- Edge or Chrome for Web Agent workers
+- Tailscale when using the recommended Funnel path to ChatGPT Web
+
+Install WAS:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[mcp]"
+```
+
+PowerShell:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -e ".[mcp]"
+```
+
+Install the local browser bridge:
+
+```bash
+cd bridge
+npm install
+npm start
+```
+
+Load `browser-extension/` as an unpacked extension in Edge/Chrome and leave its bridge
+WebSocket on localhost. **Do not expose the browser bridge through Tailscale Funnel.**
+Only the CodexPro MCP endpoint should be published.
+
+### 2. Build the complete vendored CodexPro
+
+Linux/macOS/WSL:
+
+```bash
+./scripts/setup-codexpro.sh
+```
+
+PowerShell:
+
+```powershell
+.\scripts\setup-codexpro.ps1
+```
+
+Equivalent manual commands:
+
+```bash
+cd integrations/codexpro
+npm ci
+npm run build
+```
+
+The setup script verifies SHA-256, extracts the complete source into local
+`.runtime/codexpro/`, runs `npm ci`, and builds the real `dist/stdio.js` and `dist/http.js`.
+`integrations/codexpro/WAS_VENDOR.md` records the upstream version and commit.
+
+### 3. Choose the workspace CodexPro may access
+
+Pass a narrow workspace root at launch rather than exposing a whole home directory:
+
+```text
+<workspace-root>
+```
+
+For example, the launcher accepts:
+
+```bash
+./scripts/start-codexpro.sh start --root <workspace-root>
+```
+
+PowerShell:
+
+```powershell
+.\scripts\start-codexpro.ps1 start --root <workspace-root>
+```
+
+CodexPro constrains file operations to its configured roots and blocks common credential,
+dependency, and build paths. The workspace root is still the primary access boundary.
+
+### 4. Recommended ChatGPT Web transport: Tailscale Funnel
+
+Install Tailscale from the official package for the operating system, sign in, and verify
+that the node is connected:
+
+```bash
+tailscale up
+tailscale status
+```
+
+Tailscale Funnel requires the tailnet's Funnel capability plus HTTPS/MagicDNS support.
+CodexPro has a built-in Tailscale mode; use it instead of manually exposing the bridge.
+After identifying the device's Funnel hostname, start:
+
+```bash
+./scripts/start-codexpro.sh tailscale \
+  --root <workspace-root> \
+  --hostname <device-funnel-hostname>
+```
+
+PowerShell:
+
+```powershell
+.\scripts\start-codexpro.ps1 tailscale `
+  --root <workspace-root> `
+  --hostname <device-funnel-hostname>
+```
+
+CodexPro runs its MCP HTTP server on loopback and asks Tailscale Funnel to publish it as
+HTTPS. It prints/copies the final **ChatGPT Server URL**, ending in `/mcp`.
+
+Important distinction:
+
+- in ChatGPT, choose **Authentication: No Authentication / None**;
+- CodexPro can still protect the public endpoint with its own private
+  `codexpro_token` embedded in the copied Server URL;
+- therefore do **not** remove the token from the URL and do **not** select OAuth merely
+  because the URL is public;
+- do not commit or share the generated Server URL because the query token is a secret.
+
+This is the intended developer-mode setup. OAuth is not part of the normal WAS + CodexPro
+installation flow documented here.
+
+Useful Tailscale checks:
+
+```bash
+tailscale funnel status
+```
+
+Stop/reset the Funnel when it is no longer needed according to the installed Tailscale
+CLI version.
+
+### 5. Enable Developer mode in ChatGPT Web
+
+The exact menu label can vary by ChatGPT rollout. Use the Developer mode toggle available
+in your account/workspace:
+
+- if your UI exposes **Settings -> Security and login -> Developer mode**, enable it there;
+- current OpenAI documentation for Business/Enterprise/Edu also documents
+  **Settings -> Apps -> Advanced Settings -> Developer mode** and
+  **Workspace settings -> Apps -> Create** as supported entry points.
+
+Full MCP write/modify support is plan/workspace dependent. Use ChatGPT Web; custom MCP app
+support is not a local-browser-extension feature.
+
+### 6. Add CodexPro in the app/plugin page
+
+With Developer mode enabled:
+
+1. Open the ChatGPT **Apps/Plugins** configuration page.
+2. Click **Create** or the round **+** button next to the custom app/plugin control,
+   depending on the UI version.
+3. Give the app a name such as `CodexPro`.
+4. Choose the connection type **Server URL** when that option is shown.
+5. Paste the **complete Server URL printed/copied by CodexPro**. It should contain the
+   HTTPS Funnel hostname and `/mcp`; if CodexPro appended `codexpro_token`, keep it intact.
+6. For authentication, explicitly choose
+   **No Authentication / None**. Some forms default to OAuth; change it to No
+   Authentication before creating the app.
+7. Click **Scan Tools** and wait for tool discovery to finish.
+8. Click **Create/Save**.
+9. In a new ChatGPT Web conversation, enable/select the CodexPro app and start with
+   read-only checks such as `server_config`, `open_current_workspace`, and
+   `codexpro_self_test` before allowing edits or bash commands.
+
+The key configuration is therefore:
+
+```text
+Connection:      Server URL
+Server URL:      https://<funnel-host>/mcp?...codexpro_token=...
+Authentication:  No Authentication / None
+Developer mode:  On
+```
+
+Do **not** choose OAuth for this documented development configuration.
+
+### 7. Troubleshooting
+
+If tool scanning or connection fails, check in this order:
+
+```text
+vendored CodexPro built
+  -> CodexPro process is still running
+  -> workspace root exists and is allowed
+  -> tailscale status is healthy
+  -> tailscale funnel status shows the expected mapping
+  -> copied Server URL is complete and still contains its token
+  -> ChatGPT Developer mode is enabled
+  -> ChatGPT connection type is Server URL
+  -> ChatGPT Authentication is No Authentication / None
+  -> Scan Tools succeeds
+```
+
+If the ChatGPT page itself becomes white/unresponsive, WAS does not immediately create a
+new conversation. It confirms the transport fault, refreshes/recycles the **same bound
+conversation** into a fresh renderer, verifies it, and only escalates to rollover if that
+bounded recovery fails. Durable Task/Run/checkpoint ownership is unchanged by this repair.
+
+### 8. Local STDIO use
+
+For a local MCP host rather than ChatGPT Web, use the built vendor output directly after
+building:
+
+```text
+node <path-to-web-agent-swarm>/integrations/codexpro/dist/stdio.js
+```
+
+`examples/mcp-config.example.json` contains a generic STDIO example for both WAS and the
+vendored CodexPro server.
+
+### 9. What is vendored
+
+`integrations/codexpro/codexpro-0.30.0-src.tar.gz` contains the complete Git-tracked
+CodexPro source tree: TypeScript MCP server, HTTP/STDIO transports, repository analysis,
+search, image/attachment support, handoff tooling, launcher, tests/smokes, package metadata,
+docs, security documentation, and license. It is kept as one archive only to reduce Git/Web
+upload file count. `setup-codexpro` expands it locally into `.runtime/codexpro/`.
+
+The archive excludes only non-source/runtime artifacts: nested `.git`, `node_modules`,
+generated build output, local profiles, credentials/tokens, and machine-specific state.
+
+For CodexPro-specific details, see:
+
+- after running setup: `.runtime/codexpro/README.md`
+- after running setup: `.runtime/codexpro/README_ZH.md`
+- after running setup: `.runtime/codexpro/SECURITY.md`
+- `integrations/codexpro/WAS_VENDOR.md`
+
+OpenAI's current developer-mode guidance is linked from:
+<https://help.openai.com/en/articles/12584461>.
 
 ## Dynamic swarm startup
 
@@ -274,6 +522,15 @@ Transport detection is split into small watchdogs rather than one monolithic sna
 
 Watchdogs are observation-only: they never mutate task ownership or publish canonical state.
 
+A bound `unresponsive`/white-screen page now has a deterministic first-line recovery path.
+WAS performs one confirmation inspect; if the same bound page is still unresponsive it
+reopens the **same conversation URL** in a fresh renderer/tab, retires the stale page,
+re-resolves the same conversation ID, and re-inspects it. Task/lease/checkpoint/superstep
+ownership is not changed. Only a failed bounded refresh may escalate to conversation
+rollover or manual transport recovery. This is intentionally different from a
+conversation-length rollover, which creates a new conversation while preserving durable
+ownership.
+
 ### Deterministic scheduler benchmark
 
 Run:
@@ -368,20 +625,23 @@ Available MCP tools:
 - `swarm_superstep_get`
 - `swarm_superstep_list`
 
-## Bundled CodexPro Lite
+## Bundled complete CodexPro
 
-This repository now includes a clean-room CodexPro-compatible MCP implementation:
+WAS vendors the complete CodexPro source as `integrations/codexpro/codexpro-0.30.0-src.tar.gz`;
+there is no separate Python `CodexPro Lite` implementation. Build it with:
 
-`python -m web_agent_swarm.codexpro_server`
+```bash
+./scripts/setup-codexpro.sh
+```
 
-It exposes the same core action surface used by the swarm workflow: workspace open/inspect,
-tree/search/read, write/edit/apply_patch, allowlisted verification commands, background
-run/status/cancel, change review, handoff, compact/resume/export context, skill loading,
-self-test, and the `codexpro(action, args)` supertool wrapper.
+Then launch the same CodexPro CLI through:
 
-It does **not** copy private connector code, authentication, machine-specific roots, or
-private configuration. Deep repository symbol/relationship indexing and other proprietary
-server internals are intentionally not claimed as byte-for-byte parity.
+```bash
+./scripts/start-codexpro.sh <codexpro arguments>
+```
+
+The vendored source retains its upstream MIT license and security documentation. See
+`integrations/codexpro/WAS_VENDOR.md` for the pinned version/commit and vendoring policy.
 
 ## Development
 

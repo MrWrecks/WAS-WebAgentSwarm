@@ -8,13 +8,14 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 
 FORBIDDEN_DIRS = {"node_modules", "__pycache__", ".web-agent-swarm"}
+IGNORED_GENERATED_ROOTS = {".runtime", ".venv"}
 SECRET_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
     re.compile(r"ghp_[A-Za-z0-9]{20,}"),
     re.compile(r"(?i)(api[_-]?key|access[_-]?token|password)\s*[:=]\s*[^<\s][^\s]{7,}"),
 ]
 MACHINE_PATH_PATTERNS = [
-    re.compile(r"[A-Za-z]:\\Users\\[^\\\s]+"),
+    re.compile(r"[A-Za-z]:\\Users\\(?!<)[^\\\s]+"),
     re.compile(r"/Users/[^/\s]+"),
     re.compile(r"/home/[^/\s]+"),
     re.compile(r"(?i)\\\\wsl(?:\.localhost|\$)?\\"),
@@ -26,6 +27,9 @@ MACHINE_PATH_PATTERNS = [
 issues = []
 
 for path in ROOT.rglob("*"):
+    rel_parts = path.relative_to(ROOT).parts
+    if rel_parts and rel_parts[0] in IGNORED_GENERATED_ROOTS:
+        continue
     if path.is_dir() and path.name in FORBIDDEN_DIRS:
         issues.append("generated directory present: {0}".format(path.relative_to(ROOT)))
         continue

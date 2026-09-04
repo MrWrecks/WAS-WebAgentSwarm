@@ -1,2 +1,10 @@
 @echo off
-wsl.exe -d WSL_Rocky9.7_backend -- bash -lc "cd /mnt/c/Users/Admin/Desktop/WebAgentSwarm && export PYTHONPATH=src && exec python3 -m web_agent_swarm.watcher --interval 300 --max-silence 300 >> /home/maxwell/.web-agent-swarm/watcher.log 2>&1"
+setlocal
+pushd "%~dp0.."
+if defined WAS_DISTRO_NAME (
+  wsl.exe -d "%WAS_DISTRO_NAME%" -- bash -lc "export PYTHONPATH=src && exec python3 -m web_agent_swarm.watcher --interval 300 --max-silence 300"
+) else (
+  wsl.exe -- bash -lc "export PYTHONPATH=src && exec python3 -m web_agent_swarm.watcher --interval 300 --max-silence 300"
+)
+popd
+endlocal

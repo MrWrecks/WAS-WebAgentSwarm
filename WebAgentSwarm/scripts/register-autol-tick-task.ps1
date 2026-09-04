@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 $TaskName = "WebAgentSwarmWatcher"
-$Script = "C:\Users\Admin\Desktop\WebAgentSwarm\scripts\run-autol-tick-loop.ps1"
+$Script = Join-Path $PSScriptRoot "run-autol-tick-loop.ps1"
 
 $Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Script`""
 $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME

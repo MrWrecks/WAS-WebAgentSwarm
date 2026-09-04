@@ -3,9 +3,71 @@ import time
 import unittest
 from pathlib import Path
 
-from web_agent_swarm.codexpro_core import CodexProLiteRuntime
 from web_agent_swarm.mvcc import LaneManager, normalize_resource, resources_overlap
 from web_agent_swarm.state import DurableStore
+
+
+class MVCCGuardHarness:
+    """Small test-only file/tool harness around WAS LaneManager guards.
+
+    The authoritative CodexPro MCP is the vendored Node/TypeScript implementation.
+    These tests exercise WAS MVCC semantics directly rather than depending on a
+    second Python MCP implementation.
+    """
+
+    def __init__(self, root, state_root):
+        self.root = Path(root).resolve()
+        self.store = DurableStore(Path(state_root))
+        self.lanes = LaneManager(self.store)
+        self.workspace_id = "test-workspace"
+
+    def open_current_workspace(self):
+        return {"workspace_id": self.workspace_id, "root": str(self.root)}
+
+    def _target(self, relative):
+        target = (self.root / relative).resolve()
+        target.relative_to(self.root)
+        return target
+
+    def read(self, path, workspace_id=""):
+        self.lanes.guard_read(self.root, path)
+        target = self._target(path)
+        return {"text": target.read_text(encoding="utf-8")}
+
+    def write(self, path, content, workspace_id=""):
+        self.lanes.guard_mutation(self.root, path, operation="write")
+        target = self._target(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return {"path": path}
+
+    def edit(self, path, old_text, new_text, workspace_id=""):
+        self.lanes.guard_read(self.root, path)
+        self.lanes.guard_mutation(self.root, path, operation="edit")
+        target = self._target(path)
+        text = target.read_text(encoding="utf-8")
+        if old_text not in text:
+            raise ValueError("old_text not found")
+        target.write_text(text.replace(old_text, new_text, 1), encoding="utf-8")
+        return {"path": path, "replacements": 1}
+
+    def search(self, query, workspace_id=""):
+        self.lanes.record_opaque_read(self.root, command="search")
+        matches = []
+        for item in self.root.rglob("*"):
+            if not item.is_file():
+                continue
+            try:
+                body = item.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            if query in body:
+                matches.append(str(item.relative_to(self.root)))
+        return {"matches": matches}
+
+    def bash(self, command, workspace_id=""):
+        self.lanes.guard_mutation(self.root, "", operation="bash")
+        return {"command": command, "exitCode": 0}
 
 
 class MVCCLaneTest(unittest.TestCase):
@@ -31,7 +93,7 @@ class MVCCLaneTest(unittest.TestCase):
         return self.store.task_claim(task_id, worker, lease_seconds=120)
 
     def _runtime(self, root):
-        runtime = CodexProLiteRuntime(str(root), state_root=str(self.state_root))
+        runtime = MVCCGuardHarness(str(root), state_root=str(self.state_root))
         opened = runtime.open_current_workspace()
         return runtime, opened["workspace_id"]
 

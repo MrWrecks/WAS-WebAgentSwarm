@@ -1,5 +1,8 @@
 """Optional FastMCP server for Web Agent Swarm."""
 
+import argparse
+import os
+
 try:
     from fastmcp import FastMCP
 except ImportError as exc:
@@ -93,6 +96,12 @@ def web_agent_swarm_start(
 def web_agent_swarm_rollover_exhausted(name: str):
     """Replace one length-exhausted main/worker conversation without changing durable ownership."""
     return swarm.rollover_exhausted(name)
+
+
+@mcp.tool
+def web_agent_swarm_recover_unresponsive(name: str):
+    """Refresh one confirmed-unresponsive bound conversation without changing durable ownership."""
+    return swarm.recover_unresponsive_binding(name)
 
 
 @mcp.tool
@@ -861,5 +870,24 @@ def swarm_status_get():
     return store.status()
 
 
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Run Web Agent Swarm MCP server")
+    parser.add_argument("--transport", choices=["stdio", "http", "sse"], default=os.environ.get("WAS_MCP_TRANSPORT", "stdio"))
+    parser.add_argument("--host", default=os.environ.get("WAS_MCP_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("WAS_MCP_PORT", "8810")))
+    parser.add_argument("--path", default=os.environ.get("WAS_MCP_PATH", "/mcp"))
+    parser.add_argument("--allow-unauthenticated-http", action="store_true")
+    args = parser.parse_args(argv)
+    if args.transport != "stdio" and not os.environ.get("FASTMCP_SERVER_AUTH") and not args.allow_unauthenticated_http:
+        raise SystemExit(
+            "Refusing unauthenticated network MCP. Configure FASTMCP_SERVER_AUTH (recommended) "
+            "or pass --allow-unauthenticated-http for short-lived development."
+        )
+    if args.transport == "stdio":
+        mcp.run()
+    else:
+        mcp.run(transport=args.transport, host=args.host, port=args.port, path=args.path)
+
+
 if __name__ == "__main__":
-    mcp.run()
+    main()

@@ -31,7 +31,9 @@ TICK = (
     "scale-in uses hysteresis and must respect task leases, supersteps, and generating tabs. "
     "A pending excess_since worker is capacity maintenance work and may need a later scale tick. "
     "Use swarm_checkpoint_create before risky coordination rewrites; restore only when no live "
-    "lease or open superstep exists. Conversation-length exhaustion is transport lifecycle debt: "
+    "lease or open superstep exists. A bound unresponsive/white-screen page is transport lifecycle debt: "
+    "call web_agent_swarm_recover_unresponsive(name) first so the exact same conversation is refreshed; only escalate if refresh fails. "
+    "Conversation-length exhaustion is a separate transport lifecycle debt: "
     "replace the exact exhausted worker instance with a fresh same-name/same-role conversation, preserve "
     "durable leases and task ownership, and close the old tab after the fresh binding is stable. Never "
     "scale merely because a browser tab is idle, never duplicate a valid lease. A send ACK timeout may have executed: reconcile command_id with "
@@ -349,8 +351,8 @@ def _browser_event_requires_tick(event: dict) -> bool:
     return BrowserLifecycleWatchdog.requires_tick(event)
 
 
-def _rollover_exhausted_workers(runtime: SwarmRuntime) -> list:
-    """Inspect all bound live workers and replace any length-exhausted conversation in place."""
+def _recover_and_rollover_workers(runtime: SwarmRuntime) -> list:
+    """Self-heal unresponsive workers, then roll over only length-exhausted chats."""
     outcomes = []
     for name, binding in sorted(runtime.store.bindings().items()):
         if name == "main" or not isinstance(binding, dict) or binding.get("suspended"):
@@ -360,10 +362,17 @@ def _rollover_exhausted_workers(runtime: SwarmRuntime) -> list:
             continue
         inspected = runtime.bridge.inspect(int(tab["id"]), tail=1)
         if not inspected.get("ok"):
+            if runtime._inspect_is_unresponsive(inspected):
+                outcomes.append(runtime.recover_unresponsive_binding(name))
             continue
         if conversation_limit_reached(inspected.get("snapshot") or {}):
             outcomes.append(runtime.rollover_worker_if_exhausted(name))
     return outcomes
+
+
+# Backward-compatible name retained for callers/tests.
+def _rollover_exhausted_workers(runtime: SwarmRuntime) -> list:
+    return _recover_and_rollover_workers(runtime)
 
 
 def _main_idle(snapshot: dict) -> bool:
@@ -404,8 +413,11 @@ def run(interval: float = 300.0, max_silence: float = 300.0, once: bool = False)
         )
         _scale_out_productive_work(runtime)
         runtime.cleanup_rollover_close_debt()
-        worker_rollovers = _rollover_exhausted_workers(runtime)
-        if any(item.get("rolled_over") for item in worker_rollovers if isinstance(item, dict)):
+        worker_rollovers = _recover_and_rollover_workers(runtime)
+        if any(
+            item.get("rolled_over") or item.get("recovered")
+            for item in worker_rollovers if isinstance(item, dict)
+        ):
             pending = True
             last_digest = None
         snapshot = _watch_snapshot(runtime)
@@ -418,6 +430,19 @@ def run(interval: float = 300.0, max_silence: float = 300.0, once: bool = False)
             ),
             {},
         )
+        if str(main_item.get("browser_state") or "") == "unresponsive":
+            recovered = runtime.recover_unresponsive_binding("main")
+            if recovered.get("recovered"):
+                snapshot = _watch_snapshot(runtime)
+                pending = True
+                last_digest = None
+                main_item = next(
+                    (item for item in snapshot.get("agents", []) if item.get("name") == "main"),
+                    {},
+                )
+            elif once:
+                return 4
+
         if conversation_limit_reached(main_item.get("ui")):
             rollover = runtime.rollover_main_if_exhausted()
             if rollover.get("rolled_over"):

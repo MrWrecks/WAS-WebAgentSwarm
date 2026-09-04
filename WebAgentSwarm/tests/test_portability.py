@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FORBIDDEN = [
     re.compile("wsl" + r"\.localhost", re.I),
     re.compile("WSL" + r"_[A-Za-z0-9_.-]+", re.I),
-    re.compile(r"[A-Za-z]:\\Users\\[^\\\s]+"),
+    re.compile(r"[A-Za-z]:\\Users\\(?!<)[^\\\s]+"),
 ]
 
 

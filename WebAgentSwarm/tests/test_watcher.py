@@ -185,6 +185,43 @@ class WatcherSemanticsTest(unittest.TestCase):
         self.assertEqual(alerts[0]["kind"], "worker_conversation_limit")
         self.assertEqual(alerts[0]["name"], "implementer")
 
+    def test_worker_sweep_recovers_unresponsive_before_rollover(self):
+        class Store:
+            def bindings(self):
+                return {"implementer": {"kind": "worker", "role": "implementer"}}
+
+        class Bridge:
+            def inspect(self, tab_id, tail=1):
+                return {
+                    "ok": False,
+                    "error": "Timed out waiting for extension response.",
+                    "browserState": "unresponsive",
+                }
+
+        class Runtime:
+            def __init__(self):
+                self.store = Store()
+                self.bridge = Bridge()
+                self.calls = []
+
+            def _resolve(self, name):
+                return {"id": 22}
+
+            def _inspect_is_unresponsive(self, result):
+                return True
+
+            def recover_unresponsive_binding(self, name):
+                self.calls.append(name)
+                return {"ok": True, "reloaded": True, "recovered": True, "name": name}
+
+            def rollover_worker_if_exhausted(self, name):
+                raise AssertionError("unresponsive must refresh before rollover")
+
+        runtime = Runtime()
+        outcomes = _rollover_exhausted_workers(runtime)
+        self.assertEqual(runtime.calls, ["implementer"])
+        self.assertTrue(outcomes[0]["recovered"])
+
     def test_worker_rollover_sweep_checks_idle_bound_workers_too(self):
         class Store:
             def bindings(self):

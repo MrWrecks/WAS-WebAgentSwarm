@@ -133,3 +133,22 @@ from any private/full CodexPro deployment.
 ## Optional service installation
 
 Linux/systemd user: `scripts/install-service.sh`. Windows Scheduled Tasks: `scripts\\install-service.ps1`. Both use current-user paths and do not require UNC or administrator-specific roots.
+
+## ChatGPT Web / remote MCP
+
+WAS stores the complete vendored CodexPro source in the single checked archive `integrations/codexpro/codexpro-0.30.0-src.tar.gz`; setup extracts it locally into `.runtime/codexpro/`.
+
+1. Build it with `scripts/setup-codexpro.sh` or `scripts/setup-codexpro.ps1`.
+2. Start its built-in Tailscale mode with a narrow `--root` and the device Funnel hostname.
+3. In ChatGPT Web enable Developer mode.
+4. Create/add a custom app/plugin using the **Server URL** printed by CodexPro.
+5. Set **Authentication: No Authentication / None**. Do not choose OAuth for this
+   documented developer configuration.
+6. Run **Scan Tools**, then create/save the app.
+
+CodexPro may include its own private `codexpro_token` in the Server URL. Keep the full URL
+intact; ChatGPT still uses **No Authentication / None** because CodexPro's URL token is
+handled by the server URL rather than ChatGPT's OAuth flow.
+
+The full, maintained walkthrough and troubleshooting sequence is in the root `README.md`
+under **Install and connect from ChatGPT Web**.

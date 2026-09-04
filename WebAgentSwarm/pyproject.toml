@@ -18,7 +18,7 @@ mcp = ["fastmcp>=2.0,<3"]
 [project.scripts]
 web-agent-swarm = "web_agent_swarm.cli:main"
 web-agent-swarm-watch = "web_agent_swarm.watcher:main"
-web-agent-swarm-codexpro = "web_agent_swarm.codexpro_server:main"
+web-agent-swarm-mcp = "web_agent_swarm.mcp_server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/web_agent_swarm"]

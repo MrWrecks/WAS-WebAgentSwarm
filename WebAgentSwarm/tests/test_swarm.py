@@ -63,6 +63,18 @@ class FakeBridge:
             "tabId": int(tab_id),
         }
 
+    def refresh_tab(self, tab_id):
+        target = next(tab for tab in self.tabs_data if int(tab["id"]) == int(tab_id))
+        opened = self.open_tab(target["url"], active=bool(target.get("active")))
+        self.close_tab(tab_id)
+        return {
+            "ok": True,
+            "oldTabId": int(tab_id),
+            "tabId": int(opened["tab"]["id"]),
+            "tab": opened["tab"],
+            "recycled": True,
+        }
+
 
 class SwarmRuntimeTest(unittest.TestCase):
     def test_transient_web_conversation_id_is_not_stable(self):
@@ -74,6 +86,67 @@ class SwarmRuntimeTest(unittest.TestCase):
             conversation_id("https://chatgpt.com/c/6a92d549-4410-83e9-a368-af961df580c1"),
             "6a92d549-4410-83e9-a368-af961df580c1",
         )
+
+    def test_unresponsive_binding_refreshes_same_conversation_and_preserves_ownership(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = FakeBridge()
+            store = DurableStore(Path(tmp))
+            swarm = SwarmRuntime(bridge=bridge, store=store)
+            bridge.tabs_data = [{
+                "id": 202, "windowId": 1, "index": 0, "title": "Worker",
+                "url": "https://chatgpt.com/c/worker-conv", "active": False,
+            }]
+            store.bind("implementer", {
+                "kind": "worker", "role": "implementer",
+                "conversation_id": "worker-conv",
+                "url_at_bind": "https://chatgpt.com/c/worker-conv",
+            })
+            calls = {"inspect": 0}
+            original_inspect = bridge.inspect
+
+            def inspect(tab_id, tail=6):
+                calls["inspect"] += 1
+                if calls["inspect"] == 1:
+                    return {
+                        "ok": False,
+                        "error": "Timed out waiting for extension response.",
+                        "browserState": "unresponsive",
+                    }
+                return original_inspect(tab_id, tail=tail)
+
+            bridge.inspect = inspect
+            result = swarm.recover_unresponsive_binding("implementer")
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["reloaded"])
+            self.assertTrue(result["recovered"])
+            self.assertFalse(result["durable_ownership_mutated"])
+            self.assertEqual(result["conversation_id"], "worker-conv")
+            binding = store.bindings()["implementer"]
+            self.assertEqual(binding["conversation_id"], "worker-conv")
+            self.assertEqual(binding["reload_recovery_count"], 1)
+            self.assertTrue(binding["last_reload_recovery_ok"])
+            self.assertEqual(len(bridge.tabs_data), 1)
+            self.assertEqual(conversation_id(bridge.tabs_data[0]["url"]), "worker-conv")
+
+    def test_unresponsive_recovery_does_not_refresh_after_transient_probe_recovers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = FakeBridge()
+            store = DurableStore(Path(tmp))
+            swarm = SwarmRuntime(bridge=bridge, store=store)
+            bridge.tabs_data = [{
+                "id": 202, "windowId": 1, "index": 0, "title": "Worker",
+                "url": "https://chatgpt.com/c/worker-conv", "active": False,
+            }]
+            store.bind("implementer", {
+                "kind": "worker", "role": "implementer",
+                "conversation_id": "worker-conv",
+                "url_at_bind": "https://chatgpt.com/c/worker-conv",
+            })
+            result = swarm.recover_unresponsive_binding("implementer")
+            self.assertTrue(result["ok"])
+            self.assertFalse(result["reloaded"])
+            self.assertEqual(result["reason"], "confirm_probe_recovered")
+            self.assertEqual(bridge.tabs_data[0]["id"], 202)
 
     def test_exhausted_main_rolls_over_without_mutating_durable_work(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -68,6 +68,27 @@ class BridgeClientTest(unittest.TestCase):
             timeout=9.0,
         )
 
+    def test_refresh_tab_recycles_exact_conversation_with_existing_primitives(self):
+        client = BridgeClient("http://example.invalid")
+        target = {
+            "id": 7,
+            "url": "https://chatgpt.com/c/same-conversation",
+            "active": False,
+        }
+        with mock.patch.object(client, "tabs", return_value={"ok": True, "tabs": [target]}), \
+             mock.patch.object(client, "open_tab", return_value={
+                 "ok": True,
+                 "tab": {"id": 8, "url": target["url"], "active": False},
+             }) as opened, \
+             mock.patch.object(client, "close_tab", return_value={"ok": True}) as closed:
+            result = client.refresh_tab(7)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["recycled"])
+        self.assertEqual(result["oldTabId"], 7)
+        self.assertEqual(result["tabId"], 8)
+        opened.assert_called_once_with(url=target["url"], active=False)
+        closed.assert_called_once_with(7)
+
     def test_open_tab_never_launches_another_profile(self):
         client = BridgeClient("http://example.invalid")
         with mock.patch.object(

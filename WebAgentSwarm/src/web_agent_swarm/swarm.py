@@ -1250,8 +1250,9 @@ class SwarmRuntime:
             "to compare durable work pressure with active instance counts, then apply "
             "web_agent_swarm_scale for recommended additions/removals under the global worker "
             "budget. Automatic scale-in uses hysteresis and must preserve bindings and refuse "
-            "workers with live leases/supersteps/generation. Treat conversation-length exhaustion as transport lifecycle debt: "
-            "replace main or the exact worker instance with a fresh conversation, preserve the same worker name/role and any durable live lease, "
+            "workers with live leases/supersteps/generation. Treat a bound unresponsive/white-screen tab as transport lifecycle debt: "
+            "confirm it once, refresh the exact same conversation before any rollover, preserve durable ownership, and escalate only if refresh fails. "
+            "Treat conversation-length exhaustion as a different transport lifecycle debt: replace main or the exact worker instance with a fresh conversation, preserve the same worker name/role and any durable live lease, "
             "bind the fresh conversation before closing the exhausted old tab, and never release or duplicate work merely because chat history ended. "
             "Never scale merely because a browser tab is idle. Use swarm_checkpoint_create before risky task-graph or SwarmGraph "
             "rewrites; checkpoints include graph topology/activation and restore only when no live "
@@ -2401,6 +2402,109 @@ class SwarmRuntime:
         if clean_name == "main":
             return self.rollover_main_if_exhausted()
         return self.rollover_worker_if_exhausted(clean_name)
+
+    @staticmethod
+    def _inspect_is_unresponsive(result: Dict[str, object]) -> bool:
+        error = str((result or {}).get("error") or "")
+        state = str((result or {}).get("browserState") or "").strip()
+        lowered = error.lower()
+        return (
+            state == "unresponsive"
+            or "Timed out waiting for extension response" in error
+            or "receiving end does not exist" in lowered
+            or "message port closed" in lowered
+        )
+
+    def recover_unresponsive_binding(self, name: str) -> Dict[str, object]:
+        """Refresh one confirmed-unresponsive bound tab without changing ownership.
+
+        A stale snapshot alone is never enough: WAS performs a fresh confirmation
+        inspect first. Only a second unresponsive result is allowed to recycle the
+        exact same conversation URL into a fresh renderer/tab.
+        """
+        clean_name = str(name or "").strip()
+        binding = self.store.bindings().get(clean_name)
+        if not clean_name or not isinstance(binding, dict):
+            return {"ok": False, "reloaded": False, "error": "binding unavailable"}
+        if binding.get("suspended"):
+            return {
+                "ok": True,
+                "reloaded": False,
+                "name": clean_name,
+                "reason": "binding_suspended",
+                "durable_ownership_mutated": False,
+            }
+        tab = self._resolve(clean_name)
+        if not tab:
+            return {
+                "ok": False,
+                "reloaded": False,
+                "name": clean_name,
+                "reason": "bound_tab_not_open",
+                "durable_ownership_mutated": False,
+            }
+        original_cid = str(binding.get("conversation_id") or "")
+        confirm = self.bridge.inspect(int(tab["id"]), tail=1)
+        if confirm.get("ok"):
+            return {
+                "ok": True,
+                "reloaded": False,
+                "name": clean_name,
+                "reason": "confirm_probe_recovered",
+                "durable_ownership_mutated": False,
+            }
+        if not self._inspect_is_unresponsive(confirm):
+            return {
+                "ok": False,
+                "reloaded": False,
+                "name": clean_name,
+                "reason": "inspect_failed_nonreloadable",
+                "error": confirm.get("error"),
+                "durable_ownership_mutated": False,
+            }
+
+        refreshed = self.bridge.refresh_tab(int(tab["id"]))
+        if not refreshed.get("ok"):
+            return {
+                "ok": False,
+                "reloaded": False,
+                "name": clean_name,
+                "reason": "refresh_failed",
+                "error": refreshed.get("error"),
+                "durable_ownership_mutated": False,
+            }
+
+        after = self._resolve(clean_name)
+        after_cid = conversation_id(str((after or {}).get("url") or ""))
+        if not after or after_cid != original_cid:
+            return {
+                "ok": False,
+                "reloaded": True,
+                "recovered": False,
+                "name": clean_name,
+                "reason": "conversation_changed_after_refresh",
+                "original_conversation_id": original_cid,
+                "current_conversation_id": after_cid,
+                "durable_ownership_mutated": False,
+            }
+        verified = self.bridge.inspect(int(after["id"]), tail=1)
+        recovered = bool(verified.get("ok"))
+        current = dict(self.store.bindings().get(clean_name) or binding)
+        current["last_reload_recovery_at"] = time.time()
+        current["reload_recovery_count"] = int(current.get("reload_recovery_count") or 0) + 1
+        current["last_reload_recovery_ok"] = recovered
+        current["last_reload_recovery_error"] = "" if recovered else str(verified.get("error") or "")
+        self.store.bind(clean_name, current)
+        return {
+            "ok": recovered,
+            "reloaded": True,
+            "recovered": recovered,
+            "name": clean_name,
+            "tab_id": int(after["id"]),
+            "conversation_id": original_cid,
+            "error": None if recovered else verified.get("error"),
+            "durable_ownership_mutated": False,
+        }
 
     def snapshot(self, tail: int = 4) -> Dict[str, object]:
         bindings = self.store.bindings()
