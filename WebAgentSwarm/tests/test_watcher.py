@@ -5,6 +5,7 @@ from web_agent_swarm.watcher import (
     _digest,
     _has_unresolved_work,
     _main_idle,
+    _rollover_exhausted_workers,
     _scale_out_productive_work,
     _transport_alerts,
     _watch_snapshot,
@@ -173,6 +174,48 @@ class WatcherSemanticsTest(unittest.TestCase):
         alerts = _transport_alerts(snapshot)
         self.assertEqual(alerts[0]["kind"], "main_conversation_limit")
         self.assertFalse(_main_idle(snapshot))
+
+    def test_worker_conversation_limit_is_transport_semantic(self):
+        snapshot = self._snapshot()
+        snapshot["agents"][1]["ui"] = {
+            "generating": False,
+            "lastAssistantText": "You have reached the maximum length for this conversation.",
+        }
+        alerts = _transport_alerts(snapshot)
+        self.assertEqual(alerts[0]["kind"], "worker_conversation_limit")
+        self.assertEqual(alerts[0]["name"], "implementer")
+
+    def test_worker_rollover_sweep_checks_idle_bound_workers_too(self):
+        class Store:
+            def bindings(self):
+                return {"implementer": {"kind": "worker", "role": "implementer"}}
+
+        class Bridge:
+            def inspect(self, tab_id, tail=1):
+                return {
+                    "ok": True,
+                    "snapshot": {
+                        "lastAssistantText": "You have reached the maximum length for this conversation."
+                    },
+                }
+
+        class Runtime:
+            def __init__(self):
+                self.store = Store()
+                self.bridge = Bridge()
+                self.calls = []
+
+            def _resolve(self, name):
+                return {"id": 22}
+
+            def rollover_worker_if_exhausted(self, name):
+                self.calls.append(name)
+                return {"ok": True, "rolled_over": True, "name": name}
+
+        runtime = Runtime()
+        outcomes = _rollover_exhausted_workers(runtime)
+        self.assertEqual(runtime.calls, ["implementer"])
+        self.assertTrue(outcomes[0]["rolled_over"])
 
     def test_empty_composer_with_disabled_send_button_is_still_idle_send_target(self):
         snapshot = self._snapshot()

@@ -1250,8 +1250,10 @@ class SwarmRuntime:
             "to compare durable work pressure with active instance counts, then apply "
             "web_agent_swarm_scale for recommended additions/removals under the global worker "
             "budget. Automatic scale-in uses hysteresis and must preserve bindings and refuse "
-            "workers with live leases/supersteps/generation. Never scale merely because a browser "
-            "tab is idle. Use swarm_checkpoint_create before risky task-graph or SwarmGraph "
+            "workers with live leases/supersteps/generation. Treat conversation-length exhaustion as transport lifecycle debt: "
+            "replace main or the exact worker instance with a fresh conversation, preserve the same worker name/role and any durable live lease, "
+            "bind the fresh conversation before closing the exhausted old tab, and never release or duplicate work merely because chat history ended. "
+            "Never scale merely because a browser tab is idle. Use swarm_checkpoint_create before risky task-graph or SwarmGraph "
             "rewrites; checkpoints include graph topology/activation and restore only when no live "
             "lease/superstep exists. Do not interrupt generating workers. "
             "Send one concise instruction per durable next action and avoid duplicate instructions. "
@@ -2210,6 +2212,7 @@ class SwarmRuntime:
             closed = self.bridge.close_tab(int(old_tab["id"]))
         except Exception as exc:
             closed = {"ok": False, "error": str(exc)}
+        self._record_rollover_close_result("main", int(old_tab["id"]), closed)
 
         return {
             "ok": True,
@@ -2222,6 +2225,182 @@ class SwarmRuntime:
             "old_tab_closed": bool(closed.get("ok")),
             "close_error": None if closed.get("ok") else closed.get("error"),
         }
+
+    def _record_rollover_close_result(
+        self,
+        name: str,
+        old_tab_id: int,
+        closed: Dict[str, object],
+    ) -> None:
+        binding = self.store.bindings().get(str(name))
+        if not isinstance(binding, dict):
+            return
+        updated = dict(binding)
+        if bool((closed or {}).get("ok")):
+            updated.pop("rollover_close_pending_tab_id", None)
+            updated.pop("rollover_close_error", None)
+        else:
+            updated["rollover_close_pending_tab_id"] = int(old_tab_id)
+            updated["rollover_close_error"] = str((closed or {}).get("error") or "close failed")
+        self.store.bind(str(name), updated)
+
+    def cleanup_rollover_close_debt(self) -> Dict[str, object]:
+        """Retry closing exhausted tabs left behind by a successful conversation rollover."""
+        tab_ids = {int(tab.get("id", -1)) for tab in self._tabs()}
+        outcomes = []
+        for name, binding in self.store.bindings().items():
+            if not isinstance(binding, dict):
+                continue
+            pending = int(binding.get("rollover_close_pending_tab_id") or 0)
+            if pending <= 0:
+                continue
+            if pending not in tab_ids:
+                closed = {"ok": True, "already_closed": True, "tabId": pending}
+            else:
+                try:
+                    closed = self.bridge.close_tab(pending)
+                except Exception as exc:
+                    closed = {"ok": False, "error": str(exc), "tabId": pending}
+            self._record_rollover_close_result(str(name), pending, closed)
+            outcomes.append({
+                "name": str(name),
+                "tab_id": pending,
+                "closed": bool(closed.get("ok")),
+                "error": None if closed.get("ok") else closed.get("error"),
+            })
+        return {"ok": all(item["closed"] for item in outcomes), "outcomes": outcomes}
+
+    def rollover_worker_if_exhausted(self, name: str) -> Dict[str, object]:
+        """Replace one exhausted worker conversation without changing its durable worker identity."""
+        from .watchdogs import conversation_limit_reached
+
+        clean_name = str(name or "").strip()
+        if not clean_name or clean_name == "main":
+            return {"ok": False, "rolled_over": False, "error": "worker name is required"}
+        old_binding = self.store.bindings().get(clean_name)
+        old_tab = self._resolve(clean_name)
+        if not isinstance(old_binding, dict) or old_binding.get("suspended") or not old_tab:
+            return {
+                "ok": False,
+                "rolled_over": False,
+                "name": clean_name,
+                "error": "worker binding is unavailable or suspended",
+            }
+        role = str(old_binding.get("role") or "").strip().lower()
+        if role not in DEFAULT_ROLES:
+            return {"ok": False, "rolled_over": False, "name": clean_name, "error": "worker role is invalid"}
+
+        inspected = self.bridge.inspect(int(old_tab["id"]), tail=3)
+        if not inspected.get("ok"):
+            return {
+                "ok": False,
+                "rolled_over": False,
+                "name": clean_name,
+                "role": role,
+                "error": inspected.get("error") or "worker inspect failed",
+            }
+        if not conversation_limit_reached(inspected.get("snapshot") or {}):
+            return {
+                "ok": True,
+                "rolled_over": False,
+                "name": clean_name,
+                "role": role,
+                "reason": "conversation_not_exhausted",
+            }
+
+        old_url = str(old_tab.get("url") or old_binding.get("url_at_bind") or "")
+        target = (
+            old_url.split("/c/", 1)[0]
+            if old_url.startswith("https://chatgpt.com/") and "/c/" in old_url
+            else self._spawn_url(self._tabs())
+        )
+        if not target.startswith("https://chatgpt.com/"):
+            target = "https://chatgpt.com/"
+        opened = self.bridge.open_tab(target, active=False)
+        new_tab = opened.get("tab") if opened.get("ok") else None
+        if not new_tab:
+            return {
+                "ok": False,
+                "rolled_over": False,
+                "name": clean_name,
+                "role": role,
+                "error": opened.get("error") or "failed to open fresh worker tab",
+            }
+
+        prompt = (
+            "The watcher created this fresh conversation because worker instance {0} reached "
+            "ChatGPT's conversation-length limit. This is transport replacement only: keep the exact "
+            "worker identity {0} and role {1}; do not release, duplicate, steal, or recreate durable work solely "
+            "because the old conversation ended. Before claiming anything, inspect durable tasks for a live "
+            "lease already claimed_by {0}; resume and heartbeat that exact work when present. Do not depend on "
+            "old chat memory. "
+        ).format(clean_name, role) + self._worker_prompt(role, clean_name)
+        sent = self._send_when_ready(int(new_tab["id"]), prompt, timeout=10.0)
+        if not sent.get("ok"):
+            try:
+                self.bridge.close_tab(int(new_tab["id"]))
+            except Exception:
+                pass
+            return {
+                "ok": False,
+                "rolled_over": False,
+                "name": clean_name,
+                "role": role,
+                "error": sent.get("error") or "failed to bootstrap fresh worker conversation",
+            }
+        stable = self._wait_conversation(int(new_tab["id"]), timeout=60.0)
+        if not stable:
+            try:
+                self.bridge.close_tab(int(new_tab["id"]))
+            except Exception:
+                pass
+            return {
+                "ok": False,
+                "rolled_over": False,
+                "name": clean_name,
+                "role": role,
+                "error": "fresh worker conversation URL did not stabilize",
+            }
+
+        old_conversation_id = str(old_binding.get("conversation_id") or "")
+        self._bind(clean_name, stable, "worker", role)
+        current = dict(self.store.bindings().get(clean_name) or {})
+        updated = dict(old_binding)
+        updated.update(current)
+        updated.pop("suspended", None)
+        updated.pop("suspended_at", None)
+        updated.pop("send_health", None)
+        updated["rollover_count"] = int(old_binding.get("rollover_count") or 0) + 1
+        updated["rollover_from_conversation_id"] = old_conversation_id
+        updated["rolled_over_at"] = time.time()
+        updated["transport_replacement_only"] = True
+        self.store.bind(clean_name, updated)
+
+        try:
+            closed = self.bridge.close_tab(int(old_tab["id"]))
+        except Exception as exc:
+            closed = {"ok": False, "error": str(exc)}
+        self._record_rollover_close_result(clean_name, int(old_tab["id"]), closed)
+
+        return {
+            "ok": True,
+            "rolled_over": True,
+            "name": clean_name,
+            "role": role,
+            "old_tab_id": int(old_tab["id"]),
+            "new_tab": stable,
+            "old_conversation_id": old_conversation_id,
+            "new_conversation_id": conversation_id(str(stable.get("url") or "")),
+            "old_tab_closed": bool(closed.get("ok")),
+            "close_error": None if closed.get("ok") else closed.get("error"),
+            "durable_ownership_mutated": False,
+        }
+
+    def rollover_exhausted(self, name: str) -> Dict[str, object]:
+        clean_name = str(name or "").strip()
+        if clean_name == "main":
+            return self.rollover_main_if_exhausted()
+        return self.rollover_worker_if_exhausted(clean_name)
 
     def snapshot(self, tail: int = 4) -> Dict[str, object]:
         bindings = self.store.bindings()
@@ -2336,7 +2515,21 @@ class SwarmRuntime:
                 "needs_main_rollover": any(
                     item.get("name") == "main" for item in conversation_limit_agents
                 ),
+                "needs_worker_rollover": any(
+                    item.get("name") != "main" for item in conversation_limit_agents
+                ),
                 "conversation_limit_agents": conversation_limit_agents,
+                "rollover_close_debt": [
+                    {
+                        "name": str(name),
+                        "role": str((binding or {}).get("role") or ""),
+                        "tab_id": int((binding or {}).get("rollover_close_pending_tab_id") or 0),
+                        "error": str((binding or {}).get("rollover_close_error") or ""),
+                    }
+                    for name, binding in bindings.items()
+                    if isinstance(binding, dict)
+                    and int(binding.get("rollover_close_pending_tab_id") or 0) > 0
+                ],
                 "browser_suspended_agents": [
                     {
                         "name": item.get("name"),

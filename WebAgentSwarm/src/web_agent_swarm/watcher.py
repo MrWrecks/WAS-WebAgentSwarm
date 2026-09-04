@@ -31,8 +31,10 @@ TICK = (
     "scale-in uses hysteresis and must respect task leases, supersteps, and generating tabs. "
     "A pending excess_since worker is capacity maintenance work and may need a later scale tick. "
     "Use swarm_checkpoint_create before risky coordination rewrites; restore only when no live "
-    "lease or open superstep exists. Never scale merely because a browser tab is idle, never "
-    "duplicate a valid lease. A send ACK timeout may have executed: reconcile command_id with "
+    "lease or open superstep exists. Conversation-length exhaustion is transport lifecycle debt: "
+    "replace the exact exhausted worker instance with a fresh same-name/same-role conversation, preserve "
+    "durable leases and task ownership, and close the old tab after the fresh binding is stable. Never "
+    "scale merely because a browser tab is idle, never duplicate a valid lease. A send ACK timeout may have executed: reconcile command_id with "
     "the target tab's lastUserText/lastRole/generating state before any resend. Send only a real "
     "durable next action."
 )
@@ -347,6 +349,23 @@ def _browser_event_requires_tick(event: dict) -> bool:
     return BrowserLifecycleWatchdog.requires_tick(event)
 
 
+def _rollover_exhausted_workers(runtime: SwarmRuntime) -> list:
+    """Inspect all bound live workers and replace any length-exhausted conversation in place."""
+    outcomes = []
+    for name, binding in sorted(runtime.store.bindings().items()):
+        if name == "main" or not isinstance(binding, dict) or binding.get("suspended"):
+            continue
+        tab = runtime._resolve(name)
+        if not tab:
+            continue
+        inspected = runtime.bridge.inspect(int(tab["id"]), tail=1)
+        if not inspected.get("ok"):
+            continue
+        if conversation_limit_reached(inspected.get("snapshot") or {}):
+            outcomes.append(runtime.rollover_worker_if_exhausted(name))
+    return outcomes
+
+
 def _main_idle(snapshot: dict) -> bool:
     for item in snapshot.get("agents", []):
         if item.get("name") != "main":
@@ -384,6 +403,11 @@ def run(interval: float = 300.0, max_silence: float = 300.0, once: bool = False)
             max_new_sidecars=4,
         )
         _scale_out_productive_work(runtime)
+        runtime.cleanup_rollover_close_debt()
+        worker_rollovers = _rollover_exhausted_workers(runtime)
+        if any(item.get("rolled_over") for item in worker_rollovers if isinstance(item, dict)):
+            pending = True
+            last_digest = None
         snapshot = _watch_snapshot(runtime)
 
         main_item = next(

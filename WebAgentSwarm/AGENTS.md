@@ -10,5 +10,6 @@ This repository is intentionally generic and publishable.
 - Do not embed domain-specific project state into the generic swarm runtime.
 - The read-only planning phase must never open tabs or send messages.
 - Browser idle is not external completion truth.
+- Conversation-length exhaustion is transport lifecycle debt, never durable task completion: replace the exact main/worker conversation, preserve worker identity and durable leases, bind the fresh conversation before closing the exhausted old tab, and retry any failed old-tab close as explicit transport cleanup debt.
 - Prefer small structured state and explicit verification evidence.
 - Run unit tests and syntax checks before claiming completion.

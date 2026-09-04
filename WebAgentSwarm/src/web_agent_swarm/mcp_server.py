@@ -90,6 +90,12 @@ def web_agent_swarm_start(
 
 
 @mcp.tool
+def web_agent_swarm_rollover_exhausted(name: str):
+    """Replace one length-exhausted main/worker conversation without changing durable ownership."""
+    return swarm.rollover_exhausted(name)
+
+
+@mcp.tool
 def web_agent_swarm_snapshot(tail: int = 4):
     """Return browser worker state plus durable shared tasks/status."""
     return swarm.snapshot(tail)

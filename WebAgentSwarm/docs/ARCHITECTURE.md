@@ -371,3 +371,7 @@ conversation is enough to recover the binding.
 `uiState=idle` means only that the Web page is currently not generating. It does not
 prove that a software build, experiment, deployment, or other external task completed.
 Use durable task state and the real external verification source.
+
+## Conversation rollover lifecycle
+
+Conversation-length exhaustion is transport lifecycle debt, not durable task completion. Main and worker instances are replaced in place: a fresh conversation keeps the same stable worker name and role; durable tasks, leases, supersteps, lanes, and checkpoints are not released or duplicated solely because chat history ended; rebinding happens before the exhausted tab is closed; and a failed old-tab close is persisted as `rollover_close_pending_tab_id` so the watcher can retry exact-tab cleanup on later cycles.

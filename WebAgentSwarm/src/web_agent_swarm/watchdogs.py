@@ -59,6 +59,34 @@ class MainConversationLimitWatchdog:
         return alerts
 
 
+class WorkerConversationLimitWatchdog:
+    name = "worker_conversation_limit"
+
+    @classmethod
+    def scan(cls, snapshot: dict) -> List[Dict[str, object]]:
+        alerts = []
+        for item in snapshot.get("agents", []):
+            if item.get("name") == "main":
+                continue
+            binding = item.get("binding") or {}
+            if isinstance(binding, dict) and binding.get("suspended"):
+                continue
+            if not conversation_limit_reached(item.get("ui")):
+                continue
+            alerts.append({
+                "name": item.get("name"),
+                "role": str((binding or {}).get("role") or ""),
+                "kind": "worker_conversation_limit",
+                "watchdog": cls.name,
+                "browser_state": str(item.get("browser_state") or "").strip(),
+                "error": (
+                    "Worker ChatGPT conversation reached its length limit and must be "
+                    "transport-replaced without changing durable task ownership."
+                ),
+            })
+        return alerts
+
+
 class BrowserSuspensionWatchdog:
     name = "browser_suspension"
 
@@ -205,6 +233,7 @@ class BrowserLifecycleWatchdog:
 
 SNAPSHOT_WATCHDOGS = (
     MainConversationLimitWatchdog,
+    WorkerConversationLimitWatchdog,
     BrowserSuspensionWatchdog,
     InspectErrorWatchdog,
     GeneratingStallWatchdog,

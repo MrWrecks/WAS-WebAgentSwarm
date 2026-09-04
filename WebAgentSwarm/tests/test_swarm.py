@@ -139,6 +139,84 @@ class SwarmRuntimeTest(unittest.TestCase):
             self.assertEqual(store.status()["mission"]["value"], "preserve-me")
             self.assertIn("durable WebAgentSwarm store/graph", bridge.sent[-1][1])
 
+    def test_exhausted_worker_rolls_over_same_identity_and_preserves_durable_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = FakeBridge()
+            store = DurableStore(Path(tmp))
+            swarm = SwarmRuntime(bridge=bridge, store=store)
+            bridge.tabs_data = [
+                {"id": 101, "windowId": 1, "index": 0, "title": "Main", "url": "https://chatgpt.com/c/main-conv", "active": False},
+                {"id": 202, "windowId": 1, "index": 1, "title": "Worker", "url": "https://chatgpt.com/c/worker-conv", "active": False},
+            ]
+            store.bind("main", {"kind": "main", "role": "", "conversation_id": "main-conv", "url_at_bind": "https://chatgpt.com/c/main-conv"})
+            store.bind("implementer", {"kind": "worker", "role": "implementer", "conversation_id": "worker-conv", "url_at_bind": "https://chatgpt.com/c/worker-conv"})
+            store.status_set("mission", "preserve-worker-state")
+            original_inspect = bridge.inspect
+
+            def inspect(tab_id, tail=6):
+                result = original_inspect(tab_id, tail=tail)
+                if int(tab_id) == 202:
+                    result["snapshot"] = dict(
+                        result["snapshot"],
+                        lastAssistantText=(
+                            "You have reached the maximum length for this conversation. "
+                            "Start a new chat to continue."
+                        ),
+                    )
+                return result
+
+            bridge.inspect = inspect
+            result = swarm.rollover_worker_if_exhausted("implementer")
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["rolled_over"])
+            self.assertEqual(result["name"], "implementer")
+            self.assertEqual(result["role"], "implementer")
+            self.assertFalse(result["durable_ownership_mutated"])
+            self.assertFalse(any(int(tab["id"]) == 202 for tab in bridge.tabs_data))
+            binding = store.bindings()["implementer"]
+            self.assertEqual(binding["rollover_count"], 1)
+            self.assertEqual(binding["rollover_from_conversation_id"], "worker-conv")
+            self.assertTrue(binding["transport_replacement_only"])
+            self.assertEqual(store.status()["mission"]["value"], "preserve-worker-state")
+            self.assertIn("transport replacement only", bridge.sent[-1][1])
+            self.assertIn("claimed_by implementer", bridge.sent[-1][1])
+
+    def test_failed_old_tab_close_becomes_retryable_rollover_debt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = FakeBridge()
+            store = DurableStore(Path(tmp))
+            swarm = SwarmRuntime(bridge=bridge, store=store)
+            bridge.tabs_data = [
+                {"id": 202, "windowId": 1, "index": 0, "title": "Worker", "url": "https://chatgpt.com/c/worker-conv", "active": False}
+            ]
+            store.bind("implementer", {"kind": "worker", "role": "implementer", "conversation_id": "worker-conv", "url_at_bind": "https://chatgpt.com/c/worker-conv"})
+            original_inspect = bridge.inspect
+            original_close = bridge.close_tab
+            bridge.inspect = lambda tab_id, tail=6: dict(
+                original_inspect(tab_id, tail=tail),
+                snapshot={
+                    "generating": False,
+                    "lastAssistantText": "You have reached the maximum length for this conversation.",
+                },
+            )
+            first = {"done": False}
+
+            def close(tab_id):
+                if int(tab_id) == 202 and not first["done"]:
+                    first["done"] = True
+                    return {"ok": False, "tabId": 202, "error": "transient close failure"}
+                return original_close(tab_id)
+
+            bridge.close_tab = close
+            result = swarm.rollover_worker_if_exhausted("implementer")
+            self.assertTrue(result["rolled_over"])
+            self.assertFalse(result["old_tab_closed"])
+            self.assertEqual(store.bindings()["implementer"]["rollover_close_pending_tab_id"], 202)
+            cleanup = swarm.cleanup_rollover_close_debt()
+            self.assertTrue(cleanup["ok"])
+            self.assertFalse(any(int(tab["id"]) == 202 for tab in bridge.tabs_data))
+            self.assertNotIn("rollover_close_pending_tab_id", store.bindings()["implementer"])
+
     def test_plan_does_not_touch_browser(self):
         with tempfile.TemporaryDirectory() as tmp:
             bridge = FakeBridge()
