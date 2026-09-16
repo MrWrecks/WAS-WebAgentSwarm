@@ -1,0 +1,19 @@
+{
+  "archive": "codexpro-0.30.0-src.tar.gz",
+  "archive_sha256": "ea32c7fe935b80a2fa408b23cf457c831ad94a4c2022d7aa4733362e49a2f264",
+  "commit": "587f7fd3a4644a847bba13aeb49336056052e1f6",
+  "excluded_runtime_artifacts": [
+    ".git metadata",
+    "node_modules",
+    "generated dist",
+    "local profiles/tokens",
+    "machine-specific runtime state"
+  ],
+  "name": "CodexPro",
+  "tracked_file_count": 79,
+  "upstream": "https://github.com/rebel0789/codexpro",
+  "upstream_tree_manifest": "UPSTREAM_TREE.sha256",
+  "upstream_tree_manifest_sha256": "3e0ec415bbee4d8be12a10cd9bea9aa47fb789d0bd3329133716726504a7612d",
+  "vendoring_mode": "byte_exact_git_tracked_tree_archive",
+  "version": "0.30.0"
+}

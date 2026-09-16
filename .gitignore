@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+.web-agent-swarm/
+.ai-bridge/
+dist/
+build/
+*.egg-info/
+.env
+.runtime/
