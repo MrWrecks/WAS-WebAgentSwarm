@@ -51,3 +51,31 @@ The local coordination architecture is viable for a synthetic triggered task.
 Do not spend effort scaling to six live ChatGPT workers until the intended
 triggered input/output path has an authorized mechanism and one real
 manager–worker cycle passes.
+
+## Optional supported OpenAI API route
+
+A separate, opt-in proof of concept tests **actual model-generated** manager
+routing, worker processing, and manager acceptance through the supported
+Responses API. This does not convert ordinary ChatGPT web tabs into API sessions.
+
+Without a key (default), run a local mock with **zero external calls or cost**:
+
+```powershell
+python scripts/poc_responses_api.py
+```
+
+For a real-model round-trip, first configure an OpenAI Platform project and
+provide `OPENAI_API_KEY` to the process without committing or printing it.
+**Only after approving API billing**, run:
+
+```powershell
+python scripts/poc_responses_api.py --live
+```
+
+`--live` makes **three billable Responses API calls**, using `gpt-6-luna`
+by default; the API client sets `store: false`. The script creates an isolated
+temporary durable store, records command transactions, and never retries an
+unknown outcome. OpenAI API billing is separate from a ChatGPT subscription.
+
+The local mock and corresponding unit tests pass, but **no paid/live API call
+has been made** and no API key has been created or stored by this script.

@@ -6,7 +6,7 @@ Updated: 2026-11-16. This is an implementation record, not live deployment certi
 - Upstream: `yanchun2530/WAS-WebAgentSwarm` at `cf83412` (2026-09-17), MIT license.
 - Account-owned public fork: `MrWrecks/WAS-WebAgentSwarm`; isolated development branch `fix/extension-connection-scope`, with fork `main` unchanged.
 - Development machine: Git 2.55, Node 24.15, npm 11.12, Python 3.14. CodexPro not installed.
-- Baseline: 95 Python tests. Current: **117 Python tests pass**, plus JavaScript syntax and Git diff checks.
+- Baseline: 95 Python tests. Current: **120 Python tests pass**, plus JavaScript syntax and Git diff checks.
 - Reconnect alarm, valid extension host permissions, reduced tab scope, and non-destructive passive tab observation.
 - Windows process liveness probes are non-destructive. Durable writer locks are OS-held; live writers cannot be mistaken for expired locks.
 - Extension command IDs require explicit tab IDs; SHA-256 fingerprints bind commands to exact tab/message/expected-URL tuples.
@@ -17,6 +17,7 @@ Updated: 2026-11-16. This is an implementation record, not live deployment certi
 - Uncertain rollover open/bootstrap operations and refresh replacement outcomes create durable holds rather than deleting possible live work or making blind retries.
 - Synthetic tests: `npm run test:smoke`, `npm run test:delivery`, `npm run test:recipient`; isolated headless Edge MV3 load and bridge-restart reconnect: `npm run test:extension`. These did not visit ChatGPT or access browser conversations.
 - Externally triggered localhost manager/worker PoC passed using the actual bridge, `SwarmRuntime`, and `DurableStore`: worker crashes after task claim but before ACK, restart resumes the same lease, one task attempt finishes, and manager receives completion. See `docs/PROOF_OF_CONCEPT.md`; sessions were synthetic.
+- Optional Responses API manager/worker PoC passes against a local mock server (three exchanges, completed durable task, transport-loss stop). The live API mode is credential-gated and billable; it has **not** been executed.
 - Locked `ws@8.21.3` was installed only within the development copy, with package scripts disabled. No extension installed in a personal profile, no persistent service started, and no unrelated files changed.
 
 ## Not yet demonstrated
