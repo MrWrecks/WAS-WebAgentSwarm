@@ -308,6 +308,9 @@ const server = http.createServer((req, res) => {
       if (!text) return json(res, 400, { ok: false, error: 'text is required.' });
       const tabId = Number.isInteger(data.tabId) ? data.tabId : undefined;
       const commandId = String(data.commandId || '').trim().slice(0, 128);
+      if (!commandId) {
+        return json(res, 400, { ok: false, error: 'commandId is required for safe delivery.' });
+      }
       awaitResult(id, 'send-result', res, 12000);
       sendToCurrentProfile(JSON.stringify({ type: 'send', id, tabId, text, commandId }));
     });

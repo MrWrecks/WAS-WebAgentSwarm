@@ -1302,6 +1302,9 @@ class SwarmRuntime:
             last["attempts"] = attempts
             if last.get("ok"):
                 return last
+            if last.get("mayHaveExecuted") or last.get("uncertain"):
+                last["uncertain"] = True
+                return last
             time.sleep(delay)
             delay = min(delay * 2.0, 2.0)
         return last

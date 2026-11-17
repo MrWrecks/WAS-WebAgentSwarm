@@ -1,4 +1,5 @@
 const DEFAULT_WS = 'ws://127.0.0.1:8788/ws';
+const RECONNECT_ALARM = 'wasBridgeReconnect';
 const PROTOCOL_MIN = 5;
 const PROTOCOL_MAX = 5;
 const COMMAND_CACHE_KEY = 'wasCommandResultsV1';
@@ -8,6 +9,7 @@ let reconnectTimer = null;
 let keepAliveTimer = null;
 let connectInFlight = false;
 let bridgeHandshakeOk = false;
+let persistQueue = Promise.resolve();
 const commandResults = new Map();
 const commandInflight = new Map();
 const knownChatTabs = new Map();
@@ -33,7 +35,7 @@ function serializeTab(tab) {
   };
 }
 
-async function protectChatTab(tabOrId) {
+async function protectChatTab(tabOrId, shouldProtect = false) {
   let tab = tabOrId;
   if (Number.isInteger(tabOrId)) {
     try {
@@ -46,7 +48,7 @@ async function protectChatTab(tabOrId) {
     if (tab?.id) knownChatTabs.delete(tab.id);
     return tab || null;
   }
-  if (tab.autoDiscardable !== false) {
+  if (shouldProtect && tab.autoDiscardable !== false) {
     try {
       tab = await chrome.tabs.update(tab.id, { autoDiscardable: false });
     } catch {}
@@ -82,7 +84,10 @@ async function persistCommandResults() {
   for (const [commandId, result] of commandResults.entries()) {
     entries.push({ commandId, result, recordedAt: Date.now() / 1000 });
   }
-  await chrome.storage.local.set({ [COMMAND_CACHE_KEY]: entries.slice(-MAX_COMMAND_CACHE) });
+  persistQueue = persistQueue.catch(() => {}).then(
+    () => chrome.storage.local.set({ [COMMAND_CACHE_KEY]: entries.slice(-MAX_COMMAND_CACHE) })
+  );
+  await persistQueue;
 }
 
 async function hydrateCommandResults() {
@@ -97,14 +102,21 @@ async function hydrateCommandResults() {
   } catch {}
 }
 
-async function rememberCommand(commandId, result) {
+async function rememberCommand(commandId, result, requireDurability = false) {
   if (!commandId) return;
   commandResults.set(commandId, { ...result, commandId });
   while (commandResults.size > MAX_COMMAND_CACHE) {
     const oldest = commandResults.keys().next().value;
     commandResults.delete(oldest);
   }
-  try { await persistCommandResults(); } catch {}
+  try {
+    await persistCommandResults();
+  } catch (error) {
+    if (requireDurability) {
+      commandResults.delete(commandId);
+      throw error;
+    }
+  }
 }
 
 async function getWsUrl() {
@@ -146,13 +158,13 @@ async function resolveChatTab(tabId) {
   if (Number.isInteger(tabId)) {
     try {
       const tab = await chrome.tabs.get(tabId);
-      if (tab?.url?.startsWith('https://chatgpt.com/')) return await protectChatTab(tab);
+      if (tab?.url?.startsWith('https://chatgpt.com/')) return await protectChatTab(tab, true);
     } catch {}
     return null;
   }
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
   const tab = tabs.find(item => item.url?.startsWith('https://chatgpt.com/')) || null;
-  return await protectChatTab(tab);
+  return await protectChatTab(tab, true);
 }
 
 async function waitForTabComplete(tabId, timeoutMs = 15000) {
@@ -264,6 +276,8 @@ async function performSend(tab, payload) {
     return {
       ok: Boolean(result?.ok),
       error: result?.error || null,
+      mayHaveExecuted: !result?.ok,
+      uncertain: !result?.ok,
       tabId: tab.id,
       tabTitle: tab.title || '',
       tabUrl: tab.url || '',
@@ -273,6 +287,8 @@ async function performSend(tab, payload) {
     return {
       ok: false,
       error: String(error),
+      mayHaveExecuted: true,
+      uncertain: true,
       tabId: tab?.id,
       commandId: String(payload.commandId || '')
     };
@@ -281,19 +297,25 @@ async function performSend(tab, payload) {
 
 async function send(payload) {
   const commandId = String(payload.commandId || '').trim();
-  if (commandId && commandResults.has(commandId)) {
+  if (!commandId) {
+    sendSocket({
+      type: 'send-result', id: payload.id, ok: false,
+      error: 'commandId is required for safe delivery.'
+    });
+    return;
+  }
+  if (commandId && commandInflight.has(commandId)) {
+    const result = await commandInflight.get(commandId);
+    sendSocket({ type: 'send-result', id: payload.id, ...result, duplicate: true });
+    return;
+  }
+  if (commandResults.has(commandId)) {
     sendSocket({
       type: 'send-result',
       id: payload.id,
       ...commandResults.get(commandId),
       duplicate: true
     });
-    return;
-  }
-
-  if (commandId && commandInflight.has(commandId)) {
-    const result = await commandInflight.get(commandId);
-    sendSocket({ type: 'send-result', id: payload.id, ...result, duplicate: true });
     return;
   }
 
@@ -309,6 +331,24 @@ async function send(payload) {
     return;
   }
 
+  // Persist uncertainty before the browser can submit anything.
+  // A restart during submission must never turn into a blind resend.
+  try {
+    await rememberCommand(commandId, {
+      ok: false,
+      uncertain: true,
+      mayHaveExecuted: true,
+      tabId: tab.id,
+      error: 'Send outcome unknown; inspect the target conversation before retrying.'
+    }, true);
+  } catch {
+    sendSocket({
+      type: 'send-result', id: payload.id, ok: false, commandId,
+      mayHaveExecuted: false,
+      error: 'Could not persist send intent; nothing was submitted.'
+    });
+    return;
+  }
   const work = performSend(tab, payload);
   if (commandId) commandInflight.set(commandId, work);
   const result = await work;
@@ -322,14 +362,15 @@ async function send(payload) {
 async function commandStatus(payload) {
   const commandId = String(payload.commandId || '').trim();
   if (commandResults.has(commandId)) {
+    const result = commandResults.get(commandId);
     sendSocket({
       type: 'command-status-result',
       id: payload.id,
       ok: true,
       found: true,
-      completed: true,
+      completed: !result.uncertain,
       commandId,
-      result: commandResults.get(commandId)
+      result
     });
     return;
   }
@@ -427,9 +468,9 @@ async function connect() {
     if (!bridgeHandshakeOk) return;
 
     if (payload.type === 'list-tabs') {
-      const tabs = await chrome.tabs.query({});
+      const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
       await Promise.all(tabs.map(tab => protectChatTab(tab)));
-      const refreshed = await chrome.tabs.query({});
+      const refreshed = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
       sendSocket({
         type: 'tabs-result',
         id: payload.id,
@@ -448,7 +489,7 @@ async function connect() {
         if (!tab?.id || !tab.url?.startsWith('https://chatgpt.com/')) {
           throw new Error('New ChatGPT tab did not finish loading.');
         }
-        const protectedTab = await protectChatTab(tab);
+        const protectedTab = await protectChatTab(tab, true);
         sendSocket({
           type: 'open-result',
           id: payload.id,

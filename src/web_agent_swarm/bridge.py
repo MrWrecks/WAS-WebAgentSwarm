@@ -2,6 +2,7 @@
 
 import json
 import os
+import uuid
 from pathlib import Path
 from typing import Dict, Optional
 from urllib import error, parse, request
@@ -91,7 +92,10 @@ class BridgeClient:
                 pass
             return {"ok": False, "http_status": exc.code, "error": str(exc)}
         except Exception as exc:
-            return {"ok": False, "error": "bridge unavailable: {0}".format(exc)}
+            result = {"ok": False, "error": "bridge unavailable: {0}".format(exc)}
+            if method == "POST" and path == "/send":
+                result["mayHaveExecuted"] = True
+            return result
 
     def health(self) -> Dict[str, object]:
         result = self._json("/health", timeout=1.5)
@@ -238,12 +242,13 @@ class BridgeClient:
         if not message:
             return {"ok": False, "error": "text is required"}
         payload = {"tabId": int(tab_id), "text": message}
-        clean_command_id = str(command_id or "").strip()
-        if clean_command_id:
-            payload["commandId"] = clean_command_id
-        return self._json(
+        clean_command_id = str(command_id or "").strip() or uuid.uuid4().hex
+        payload["commandId"] = clean_command_id
+        result = self._json(
             "/send",
             method="POST",
             payload=payload,
             timeout=14.0,
         )
+        result.setdefault("command_id", clean_command_id)
+        return result

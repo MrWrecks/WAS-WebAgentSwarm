@@ -70,40 +70,46 @@ class DurableStore:
         self.backup_checksum_path = self.root / "state.json.bak.sha256"
         self.lock_path = self.root / "state.lock"
 
+    @staticmethod
+    def _lock_file(fd: int, acquire: bool) -> None:
+        # OS-held locks are automatically released if the writer process exits.
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(
+                fd, msvcrt.LK_NBLCK if acquire else msvcrt.LK_UNLCK, 1
+            )
+        else:
+            import fcntl
+            operation = (fcntl.LOCK_EX | fcntl.LOCK_NB) if acquire else fcntl.LOCK_UN
+            fcntl.flock(fd, operation)
+
     @contextmanager
     def _write_lock(self, timeout: float = 5.0):
         self.root.mkdir(parents=True, exist_ok=True)
-        deadline = time.time() + max(0.1, float(timeout))
-        fd = None
-        while fd is None:
-            try:
-                fd = os.open(
-                    str(self.lock_path),
-                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                )
-            except FileExistsError:
-                try:
-                    age = time.time() - self.lock_path.stat().st_mtime
-                    if age > 30.0:
-                        self.lock_path.unlink()
-                        continue
-                except OSError:
-                    pass
-                if time.time() >= deadline:
-                    raise TimeoutError("timed out waiting for durable store write lock")
-                time.sleep(0.02)
+        # Keep the inode/file stable; deleting an OS lock file permits a race
+        # between writers holding different file handles.
+        fd = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        acquired = False
+        deadline = time.monotonic() + max(0.1, float(timeout))
         try:
-            os.write(fd, str(os.getpid()).encode("ascii", errors="ignore"))
+            while not acquired:
+                try:
+                    self._lock_file(fd, True)
+                    acquired = True
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            "timed out waiting for durable store write lock"
+                        ) from None
+                    time.sleep(0.02)
             yield
         finally:
             try:
+                if acquired:
+                    self._lock_file(fd, False)
+            finally:
                 os.close(fd)
-            except OSError:
-                pass
-            try:
-                self.lock_path.unlink()
-            except OSError:
-                pass
 
     def _empty(self) -> Dict[str, object]:
         return {
