@@ -89,6 +89,30 @@ def main(argv=None) -> int:
     create.add_argument("--owner", default="")
     create.add_argument("--depends-on", nargs="*", default=[])
 
+    # Direct, on-demand task execution via Remote Desktop Commander requires no
+    # browser extension, local model, Codex, API key, or persistent service.
+    list_tasks = sub.add_parser("task-list")
+    list_tasks.add_argument("--status", choices=["ready", "active", "blocked", "review", "done", "failed"])
+
+    claim = sub.add_parser("task-claim")
+    claim.add_argument("task_id")
+    claim.add_argument("worker_name")
+    claim.add_argument("--lease-seconds", type=int, default=900)
+
+    heartbeat = sub.add_parser("task-heartbeat")
+    heartbeat.add_argument("task_id")
+    heartbeat.add_argument("worker_name")
+    heartbeat.add_argument("--lease-seconds", type=int, default=900)
+
+    release = sub.add_parser("task-release")
+    release.add_argument("task_id")
+    release.add_argument("worker_name")
+    release.add_argument("--status", choices=["ready", "blocked", "review", "done", "failed"], default="done")
+    release.add_argument("--summary", default="")
+    release.add_argument("--result-json", default=None)
+    release.add_argument("--error", default="")
+    release.add_argument("--no-retry", action="store_true")
+
     update = sub.add_parser("task-update")
     update.add_argument("task_id")
     update.add_argument("--status", default="")
@@ -200,6 +224,26 @@ def main(argv=None) -> int:
             args.description,
             args.owner,
             dependencies=args.depends_on,
+        ))
+    elif args.command == "task-list":
+        tasks = store.tasks()
+        emit([task for task in tasks if not args.status or task.get("status") == args.status])
+    elif args.command == "task-claim":
+        emit(store.task_claim(
+            args.task_id, args.worker_name, lease_seconds=args.lease_seconds,
+        ))
+    elif args.command == "task-heartbeat":
+        emit(store.task_heartbeat(
+            args.task_id, args.worker_name, lease_seconds=args.lease_seconds,
+        ))
+    elif args.command == "task-release":
+        emit(store.task_release(
+            args.task_id, args.worker_name,
+            status=args.status,
+            summary=args.summary,
+            result=json.loads(args.result_json) if args.result_json is not None else None,
+            error=args.error,
+            retryable=not args.no_retry,
         ))
     elif args.command == "task-update":
         emit(store.task_update(args.task_id, args.status, args.owner, args.summary))

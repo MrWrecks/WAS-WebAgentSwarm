@@ -6,7 +6,7 @@ Updated: 2026-11-16. This is an implementation record, not live deployment certi
 - Upstream: `yanchun2530/WAS-WebAgentSwarm` at `cf83412` (2026-09-17), MIT license.
 - Account-owned public fork: `MrWrecks/WAS-WebAgentSwarm`; isolated development branch `fix/extension-connection-scope`, with fork `main` unchanged.
 - Development machine: Git 2.55, Node 24.15, npm 11.12, Python 3.14. CodexPro not installed.
-- Baseline: 95 Python tests. Current: **120 Python tests pass**, plus JavaScript syntax and Git diff checks.
+- Baseline: 95 Python tests. Current: **123 Python tests pass**, plus JavaScript syntax and Git diff checks.
 - Reconnect alarm, valid extension host permissions, reduced tab scope, and non-destructive passive tab observation.
 - Windows process liveness probes are non-destructive. Durable writer locks are OS-held; live writers cannot be mistaken for expired locks.
 - Extension command IDs require explicit tab IDs; SHA-256 fingerprints bind commands to exact tab/message/expected-URL tuples.
@@ -17,7 +17,8 @@ Updated: 2026-11-16. This is an implementation record, not live deployment certi
 - Uncertain rollover open/bootstrap operations and refresh replacement outcomes create durable holds rather than deleting possible live work or making blind retries.
 - Synthetic tests: `npm run test:smoke`, `npm run test:delivery`, `npm run test:recipient`; isolated headless Edge MV3 load and bridge-restart reconnect: `npm run test:extension`. These did not visit ChatGPT or access browser conversations.
 - Externally triggered localhost manager/worker PoC passed using the actual bridge, `SwarmRuntime`, and `DurableStore`: worker crashes after task claim but before ACK, restart resumes the same lease, one task attempt finishes, and manager receives completion. See `docs/PROOF_OF_CONCEPT.md`; sessions were synthetic.
-- Optional Responses API manager/worker PoC passes against a local mock server (three exchanges, completed durable task, transport-loss stop). The live API mode is credential-gated and billable; it has **not** been executed.
+- Optional Responses API manager/worker PoC passes against a local mock server (three exchanges, completed durable task, transport-loss stop). The live API mode is credential-gated and billable; it has **not** been executed and is **excluded from the approved zero-additional-cost workflow**.
+- **Low-impact RDM execution validated:** the existing Web Agent Swarm CLI now exposes durable task list/claim/heartbeat/release. An isolated, real Remote Desktop Commander command successfully claimed a task, ran Python syntax and Git checks, and completed the task in one attempt without invoking Codex, an API, a local model, or the ChatGPT browser. See `docs/LOW_IMPACT_RDM_WORKFLOW.md`.
 - Locked `ws@8.21.3` was installed only within the development copy, with package scripts disabled. No extension installed in a personal profile, no persistent service started, and no unrelated files changed.
 
 ## Not yet demonstrated
@@ -36,10 +37,9 @@ Updated: 2026-11-16. This is an implementation record, not live deployment certi
 - CodexPro, remote command exposure, persistent startup, and live ChatGPT automation remain out of scope for this bounded development pass.
 
 ## Next acceptance gates
-1. Publish/verify this tested development branch on the fork, leaving `main` unchanged.
-2. Resolve platform-compliant chat automation, or choose a supported non-website integration.
-3. Finish credential/permission/startup review before any persistent installation.
-4. Validate one manager and worker with an authorized mechanism, including uncertain-result reconciliation.
-5. Scale only after reliable completion and recovery at the smaller scope.
+1. Publish and verify the on-demand RDM workflow on the development branch, with fork `main` unchanged.
+2. Use the existing ChatGPT conversation as manager and RDM as the computer executor for a real operator-directed task; do not consume Codex, API, or local-model resources.
+3. If independent ChatGPT browser workers become necessary, resolve authorized output transfer before any live automated extraction; synthetic integration tests do not establish such authorization.
+4. Only consider persistent services, multiple browser sessions, or six-worker operation after the simpler workflow shows an actual limitation and the relevant security/usage constraints are addressed.
 
 Rollback: local backup branches preserve prior commits; no forced history rewrite or changes to the fork's default branch.
