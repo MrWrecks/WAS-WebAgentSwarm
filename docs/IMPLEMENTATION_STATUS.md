@@ -16,6 +16,7 @@ Updated: 2026-11-16. This is an implementation record, not live deployment certi
 - Close operations can pin an expected URL. Rollover debt cleanup checks original conversation identity and refuses to close reused IDs.
 - Uncertain rollover open/bootstrap operations and refresh replacement outcomes create durable holds rather than deleting possible live work or making blind retries.
 - Synthetic tests: `npm run test:smoke`, `npm run test:delivery`, `npm run test:recipient`; isolated headless Edge MV3 load and bridge-restart reconnect: `npm run test:extension`. These did not visit ChatGPT or access browser conversations.
+- Externally triggered localhost manager/worker PoC passed using the actual bridge, `SwarmRuntime`, and `DurableStore`: worker crashes after task claim but before ACK, restart resumes the same lease, one task attempt finishes, and manager receives completion. See `docs/PROOF_OF_CONCEPT.md`; sessions were synthetic.
 - Locked `ws@8.21.3` was installed only within the development copy, with package scripts disabled. No extension installed in a personal profile, no persistent service started, and no unrelated files changed.
 
 ## Not yet demonstrated
