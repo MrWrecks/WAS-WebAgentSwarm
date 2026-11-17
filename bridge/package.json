@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "test:smoke": "node bridge-smoke.mjs"
+    "test:smoke": "node bridge-smoke.mjs",
+    "test:extension": "node extension-smoke.mjs"
   },
   "dependencies": {
     "ws": "^8.18.3"
