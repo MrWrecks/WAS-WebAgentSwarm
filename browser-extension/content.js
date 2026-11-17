@@ -131,9 +131,12 @@
     }));
   }
 
-  async function sendMessage(text) {
+  async function sendMessage(text, expectedUrl = '') {
+    if (expectedUrl && location.href !== expectedUrl) {
+      return { ok: false, terminal: true, mayHaveExecuted: false, error: 'Target conversation URL changed; message not submitted.' };
+    }
     if (generating()) {
-      return { ok: false, error: 'Target tab is generating.' };
+      return { ok: false, mayHaveExecuted: false, error: 'Target tab is generating.' };
     }
 
     let target = composer();
@@ -141,7 +144,10 @@
       await sleep(250);
       target = composer();
     }
-    if (!target) return { ok: false, error: 'Composer not found.' };
+    if (!target) return { ok: false, mayHaveExecuted: false, error: 'Composer not found.' };
+    if (expectedUrl && location.href !== expectedUrl) {
+      return { ok: false, terminal: true, mayHaveExecuted: false, error: 'Target conversation URL changed; message not submitted.' };
+    }
 
     await setText(target, text);
     await sleep(250);
@@ -152,7 +158,10 @@
       button = sendButton();
     }
     if (!button || button.disabled) {
-      return { ok: false, error: 'Send button not found or not enabled.' };
+      return { ok: false, mayHaveExecuted: false, error: 'Send button not found or not enabled.' };
+    }
+    if (expectedUrl && location.href !== expectedUrl) {
+      return { ok: false, terminal: true, mayHaveExecuted: false, error: 'Target conversation URL changed; message not submitted.' };
     }
 
     button.click();
@@ -170,7 +179,7 @@
     }
 
     if (message?.type === 'send-chatgpt-message') {
-      sendMessage(String(message.text || ''))
+      sendMessage(String(message.text || ''), String(message.expectedUrl || ''))
         .then(respond)
         .catch(error => respond({ ok: false, error: String(error) }));
       return true;

@@ -87,7 +87,41 @@ class BridgeClientTest(unittest.TestCase):
         self.assertEqual(result["oldTabId"], 7)
         self.assertEqual(result["tabId"], 8)
         opened.assert_called_once_with(url=target["url"], active=False)
-        closed.assert_called_once_with(7)
+        closed.assert_called_once_with(
+            7, expected_url="https://chatgpt.com/c/same-conversation"
+        )
+
+    def test_refresh_preserves_replacement_when_old_close_is_uncertain(self):
+        client = BridgeClient("http://example.invalid")
+        target = {
+            "id": 7, "url": "https://chatgpt.com/c/synthetic",
+            "active": False,
+        }
+        with mock.patch.object(client, "tabs", return_value={"ok": True, "tabs": [target]}), \
+             mock.patch.object(client, "open_tab", return_value={
+                 "ok": True, "tab": {"id": 8, "url": target["url"], "active": False}
+             }), \
+             mock.patch.object(client, "close_tab", return_value={
+                 "ok": False, "mayHaveExecuted": True, "error": "close ack lost"
+             }) as closed:
+            result = client.refresh_tab(7)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["uncertain"])
+        self.assertEqual(result["replacementTabId"], 8)
+        closed.assert_called_once_with(7, expected_url=target["url"])
+
+    def test_refresh_preserves_uncertain_tab_open_result(self):
+        client = BridgeClient("http://example.invalid")
+        target = {"id": 7, "url": "https://chatgpt.com/c/synthetic", "active": False}
+        with mock.patch.object(client, "tabs", return_value={"ok": True, "tabs": [target]}), \
+             mock.patch.object(client, "open_tab", return_value={
+                 "ok": False, "mayHaveExecuted": True, "error": "open ack lost"
+             }), \
+             mock.patch.object(client, "close_tab") as closed:
+            result = client.refresh_tab(7)
+        self.assertTrue(result["uncertain"])
+        self.assertTrue(result["mayHaveExecuted"])
+        closed.assert_not_called()
 
     def test_open_tab_never_launches_another_profile(self):
         client = BridgeClient("http://example.invalid")

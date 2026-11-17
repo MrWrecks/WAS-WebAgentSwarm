@@ -130,10 +130,10 @@ function awaitResult(id, type, res, timeoutMs = 5000) {
       ok: false,
       error: 'Timed out waiting for extension response.',
       requestId: id,
-      mayHaveExecuted: type === 'send-result'
+      mayHaveExecuted: ['send-result', 'open-result', 'close-result'].includes(type)
     });
   }, timeoutMs);
-  pending.set(id, { type, res, timer });
+  pending.set(id, { type, res, timer, client: connectedClient() });
 }
 
 function ensureClient(res) {
@@ -299,8 +299,12 @@ const server = http.createServer((req, res) => {
         if (!Number.isInteger(tabId)) {
           return json(res, 400, { ok: false, error: 'tabId is required.' });
         }
+        const expectedUrl = String(data.expectedUrl || '').trim();
+        if (expectedUrl && !expectedUrl.startsWith('https://chatgpt.com/')) {
+          return json(res, 400, { ok: false, error: 'Expected tab URL must be on chatgpt.com.' });
+        }
         awaitResult(id, 'close-result', res, 8000);
-        sendToCurrentProfile(JSON.stringify({ type: 'close-tab', id, tabId }));
+        sendToCurrentProfile(JSON.stringify({ type: 'close-tab', id, tabId, expectedUrl }));
         return;
       }
 
@@ -308,11 +312,15 @@ const server = http.createServer((req, res) => {
       if (!text) return json(res, 400, { ok: false, error: 'text is required.' });
       const tabId = Number.isInteger(data.tabId) ? data.tabId : undefined;
       const commandId = String(data.commandId || '').trim().slice(0, 128);
+      const expectedUrl = String(data.expectedUrl || '').trim();
+      if (expectedUrl && !expectedUrl.startsWith('https://chatgpt.com/')) {
+        return json(res, 400, { ok: false, error: 'Expected conversation URL must be on chatgpt.com.' });
+      }
       if (!commandId) {
         return json(res, 400, { ok: false, error: 'commandId is required for safe delivery.' });
       }
       awaitResult(id, 'send-result', res, 12000);
-      sendToCurrentProfile(JSON.stringify({ type: 'send', id, tabId, text, commandId }));
+      sendToCurrentProfile(JSON.stringify({ type: 'send', id, tabId, text, commandId, expectedUrl }));
     });
     return;
   }
@@ -398,7 +406,7 @@ wss.on('connection', ws => {
         return;
       }
       const item = pending.get(msg.id);
-      if (!item || item.type !== msg.type) return;
+      if (!item || item.type !== msg.type || item.client !== ws) return;
       clearTimeout(item.timer);
       pending.delete(msg.id);
       if (msg.type === 'tabs-result') {
@@ -413,6 +421,17 @@ wss.on('connection', ws => {
 
   ws.on('close', () => {
     clearTimeout(handshakeTimer);
+    for (const [requestId, item] of pending.entries()) {
+      if (item.client !== ws) continue;
+      clearTimeout(item.timer);
+      pending.delete(requestId);
+      json(item.res, 503, {
+        ok: false,
+        requestId,
+        error: 'Extension disconnected before acknowledging the request.',
+        mayHaveExecuted: ['send-result', 'open-result', 'close-result'].includes(item.type)
+      });
+    }
     const wasReady = ws.wasReady === true;
     clients.delete(ws);
     if (wasReady) {

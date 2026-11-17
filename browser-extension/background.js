@@ -9,6 +9,7 @@ let reconnectTimer = null;
 let keepAliveTimer = null;
 let connectInFlight = false;
 let bridgeHandshakeOk = false;
+let commandCacheReady = false;
 let persistQueue = Promise.resolve();
 const commandResults = new Map();
 const commandInflight = new Map();
@@ -99,7 +100,11 @@ async function hydrateCommandResults() {
       if (!commandId || !entry?.result || typeof entry.result !== 'object') continue;
       commandResults.set(commandId, entry.result);
     }
-  } catch {}
+    commandCacheReady = true;
+  } catch {
+    // Fail closed. An unreadable command cache might contain completed sends.
+    commandCacheReady = false;
+  }
 }
 
 async function rememberCommand(commandId, result, requireDurability = false) {
@@ -113,7 +118,8 @@ async function rememberCommand(commandId, result, requireDurability = false) {
     await persistCommandResults();
   } catch (error) {
     if (requireDurability) {
-      commandResults.delete(commandId);
+      // Keep the uncertain reservation in memory even if storage fails.
+      // Never let an immediate retry reuse this command ID.
       throw error;
     }
   }
@@ -271,13 +277,16 @@ async function performSend(tab, payload) {
   try {
     const result = await callContent(tab, {
       type: 'send-chatgpt-message',
-      text: payload.text
+      text: payload.text,
+      expectedUrl: payload.expectedUrl || tab.url
     });
+    const uncertain = !result?.ok && result?.mayHaveExecuted !== false;
     return {
       ok: Boolean(result?.ok),
       error: result?.error || null,
-      mayHaveExecuted: !result?.ok,
-      uncertain: !result?.ok,
+      mayHaveExecuted: uncertain,
+      uncertain,
+      terminal: Boolean(result?.terminal),
       tabId: tab.id,
       tabTitle: tab.title || '',
       tabUrl: tab.url || '',
@@ -295,68 +304,110 @@ async function performSend(tab, payload) {
   }
 }
 
-async function send(payload) {
-  const commandId = String(payload.commandId || '').trim();
-  if (!commandId) {
-    sendSocket({
-      type: 'send-result', id: payload.id, ok: false,
-      error: 'commandId is required for safe delivery.'
-    });
-    return;
-  }
-  if (commandId && commandInflight.has(commandId)) {
-    const result = await commandInflight.get(commandId);
-    sendSocket({ type: 'send-result', id: payload.id, ...result, duplicate: true });
-    return;
-  }
-  if (commandResults.has(commandId)) {
-    sendSocket({
-      type: 'send-result',
-      id: payload.id,
-      ...commandResults.get(commandId),
-      duplicate: true
-    });
-    return;
-  }
+async function sendFingerprint(tabId, text, expectedUrl) {
+  const bytes = new TextEncoder().encode(JSON.stringify([tabId, text, expectedUrl]));
+  const hash = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(hash), b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function executeSend(payload, fingerprint) {
+  const commandId = String(payload.commandId).trim();
+  const cached = commandResults.get(commandId);
+  if (cached) return { result: cached, duplicate: true };
 
   const tab = await resolveChatTab(payload.tabId);
-  if (!tab?.id) {
+  if (!tab?.id || (payload.expectedUrl && tab.url !== payload.expectedUrl)) {
     const result = {
       ok: false,
-      error: 'Target tab was not found or is not ChatGPT.',
-      commandId
+      error: !tab?.id ? 'Target tab was not found or is not ChatGPT.'
+        : 'Target conversation changed before submission; nothing was submitted.',
+      commandId, fingerprint, terminal: true, mayHaveExecuted: false
     };
-    if (commandId) await rememberCommand(commandId, result);
-    sendSocket({ type: 'send-result', id: payload.id, ...result });
-    return;
+    await rememberCommand(commandId, result);
+    return { result, duplicate: false };
   }
 
-  // Persist uncertainty before the browser can submit anything.
-  // A restart during submission must never turn into a blind resend.
+  // Reserve the command ID durably before any browser submission.
+  // Unknown completion remains unknown after worker or browser restarts.
   try {
     await rememberCommand(commandId, {
       ok: false,
       uncertain: true,
       mayHaveExecuted: true,
       tabId: tab.id,
+      fingerprint,
       error: 'Send outcome unknown; inspect the target conversation before retrying.'
     }, true);
   } catch {
+    return {
+      result: {
+        ok: false, commandId, fingerprint, mayHaveExecuted: false,
+        error: 'Could not persist send intent; nothing was submitted.'
+      },
+      duplicate: false
+    };
+  }
+
+  const result = { ...await performSend(tab, payload), fingerprint };
+  await rememberCommand(commandId, result);
+  return { result, duplicate: false };
+}
+
+async function send(payload) {
+  const commandId = String(payload.commandId || '').trim();
+  if (!commandId || !Number.isInteger(payload.tabId) || payload.tabId <= 0
+      || typeof payload.text !== 'string' || !payload.text.trim()) {
     sendSocket({
       type: 'send-result', id: payload.id, ok: false, commandId,
-      mayHaveExecuted: false,
-      error: 'Could not persist send intent; nothing was submitted.'
+      error: 'A command ID, explicit tab ID, and nonempty text are required.'
     });
     return;
   }
-  const work = performSend(tab, payload);
-  if (commandId) commandInflight.set(commandId, work);
-  const result = await work;
-  if (commandId) {
-    commandInflight.delete(commandId);
-    await rememberCommand(commandId, result);
+  if (!commandCacheReady) {
+    sendSocket({
+      type: 'send-result', id: payload.id, ok: false, commandId,
+      error: 'Durable command cache could not be loaded; send was not attempted.'
+    });
+    return;
   }
-  sendSocket({ type: 'send-result', id: payload.id, ...result, duplicate: false });
+
+  const fingerprintPromise = sendFingerprint(
+    payload.tabId, payload.text, String(payload.expectedUrl || '')
+  );
+  const inFlight = commandInflight.get(commandId);
+  // Register the work before its first await, so concurrent duplicates
+  // cannot pass through the durability check and submit twice.
+  const work = inFlight || (async () => {
+    const fingerprint = await fingerprintPromise;
+    return executeSend(payload, fingerprint);
+  })();
+  if (!inFlight) commandInflight.set(commandId, work);
+  try {
+    const [outcome, requested] = await Promise.all([work, fingerprintPromise]);
+    if (outcome.result.fingerprint !== requested) {
+      sendSocket({
+        type: 'send-result', id: payload.id, ok: false, commandId,
+        duplicate: true, uncertain: true, mayHaveExecuted: true,
+        terminal: true,
+        error: 'Command ID is already associated with another tab or message; nothing was submitted.'
+      });
+      return;
+    }
+    sendSocket({
+      type: 'send-result', id: payload.id,
+      ...outcome.result, duplicate: Boolean(inFlight || outcome.duplicate)
+    });
+  } catch (error) {
+    sendSocket({
+      type: 'send-result', id: payload.id, ok: false, commandId,
+      uncertain: true, mayHaveExecuted: true,
+      error: 'Command delivery status is uncertain: ' + String(error)
+    });
+  } finally {
+    if (!inFlight && commandInflight.get(commandId) === work) {
+      commandInflight.delete(commandId);
+    }
+  }
 }
 
 async function commandStatus(payload) {
@@ -511,6 +562,9 @@ async function connect() {
       try {
         const tab = await resolveChatTab(payload.tabId);
         if (!tab?.id) throw new Error('Target tab was not found or is not ChatGPT.');
+        if (payload.expectedUrl && tab.url !== payload.expectedUrl) {
+          throw new Error('Target tab navigated to another conversation; refusing to close it.');
+        }
         await chrome.tabs.remove(tab.id);
         sendSocket({
           type: 'close-result',

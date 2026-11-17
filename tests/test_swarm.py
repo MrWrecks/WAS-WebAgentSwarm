@@ -42,7 +42,7 @@ class FakeBridge:
             },
         }
 
-    def send(self, tab_id, text, command_id=""):
+    def send(self, tab_id, text, command_id="", expected_url=""):
         self.sent.append((tab_id, text))
         for idx, tab in enumerate(self.tabs_data):
             if tab["id"] == tab_id and "/c/" not in tab["url"]:
@@ -52,7 +52,7 @@ class FakeBridge:
                 )
         return {"ok": True, "tabId": tab_id, "commandId": command_id}
 
-    def close_tab(self, tab_id):
+    def close_tab(self, tab_id, expected_url=""):
         before = len(self.tabs_data)
         self.tabs_data = [
             tab for tab in self.tabs_data
@@ -274,11 +274,11 @@ class SwarmRuntimeTest(unittest.TestCase):
             )
             first = {"done": False}
 
-            def close(tab_id):
+            def close(tab_id, expected_url=""):
                 if int(tab_id) == 202 and not first["done"]:
                     first["done"] = True
                     return {"ok": False, "tabId": 202, "error": "transient close failure"}
-                return original_close(tab_id)
+                return original_close(tab_id, expected_url=expected_url)
 
             bridge.close_tab = close
             result = swarm.rollover_worker_if_exhausted("implementer")
@@ -289,6 +289,129 @@ class SwarmRuntimeTest(unittest.TestCase):
             self.assertTrue(cleanup["ok"])
             self.assertFalse(any(int(tab["id"]) == 202 for tab in bridge.tabs_data))
             self.assertNotIn("rollover_close_pending_tab_id", store.bindings()["implementer"])
+
+    def test_rollover_close_debt_never_closes_reused_tab_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = FakeBridge()
+            store = DurableStore(Path(tmp))
+            swarm = SwarmRuntime(bridge=bridge, store=store)
+            bridge.tabs_data = [{
+                "id": 202, "windowId": 1, "index": 0, "title": "Unrelated",
+                "url": "https://chatgpt.com/c/someone-else", "active": False,
+            }]
+            store.bind("implementer", {
+                "kind": "worker", "role": "implementer",
+                "conversation_id": "new-conversation",
+                "rollover_from_conversation_id": "old-conversation",
+                "rollover_close_pending_tab_id": 202,
+            })
+            cleanup = swarm.cleanup_rollover_close_debt()
+            self.assertFalse(cleanup["ok"])
+            self.assertEqual(cleanup["outcomes"][0]["closed"], False)
+            self.assertEqual(len(bridge.tabs_data), 1)
+            self.assertEqual(
+                store.bindings()["implementer"]["rollover_close_pending_tab_id"], 202
+            )
+
+    def test_uncertain_worker_bootstrap_is_retained_and_not_repeated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = FakeBridge()
+            bridge.tabs_data = [{
+                "id": 202, "windowId": 1, "index": 0, "title": "Worker",
+                "url": "https://chatgpt.com/c/old-worker", "active": False,
+            }]
+            store = DurableStore(Path(tmp))
+            store.bind("implementer", {
+                "kind": "worker", "role": "implementer",
+                "conversation_id": "old-worker",
+                "url_at_bind": "https://chatgpt.com/c/old-worker",
+            })
+            swarm = SwarmRuntime(bridge=bridge, store=store)
+            bridge.inspect = lambda _id, tail=3: {
+                "ok": True, "snapshot": {
+                    "lastAssistantText": "You have reached the maximum length for this conversation."
+                }
+            }
+            swarm._send_when_ready = lambda *_a, **_kw: {
+                "ok": False, "mayHaveExecuted": True,
+                "command_id": "uncertain-command", "error": "response lost"
+            }
+            first = swarm.rollover_worker_if_exhausted("implementer")
+            self.assertTrue(first["uncertain"])
+            self.assertEqual(first["pending_tab_id"], 11)
+            self.assertEqual(len(bridge.tabs_data), 2)
+            self.assertEqual(
+                store.bindings()["implementer"]["rollover_uncertain"]["command_id"],
+                "uncertain-command"
+            )
+            second = swarm.rollover_worker_if_exhausted("implementer")
+            self.assertTrue(second["uncertain"])
+            self.assertEqual(bridge.next_id, 11, "retry created another replacement tab")
+
+    def test_uncertain_main_open_is_recorded_without_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = FakeBridge()
+            bridge.tabs_data = [{
+                "id": 202, "windowId": 1, "index": 0, "title": "Main",
+                "url": "https://chatgpt.com/c/old-main", "active": False,
+            }]
+            store = DurableStore(Path(tmp))
+            store.bind("main", {
+                "kind": "main", "conversation_id": "old-main",
+                "url_at_bind": "https://chatgpt.com/c/old-main",
+            })
+            swarm = SwarmRuntime(bridge=bridge, store=store)
+            bridge.inspect = lambda _id, tail=3: {
+                "ok": True, "snapshot": {
+                    "lastAssistantText": "You have reached the maximum length for this conversation."
+                }
+            }
+            opened = []
+            def unknown_open(*args, **kwargs):
+                opened.append(args)
+                return {"ok": False, "mayHaveExecuted": True, "error": "response lost"}
+            bridge.open_tab = unknown_open
+            first = swarm.rollover_main_if_exhausted()
+            self.assertTrue(first["uncertain"])
+            self.assertEqual(store.bindings()["main"]["rollover_uncertain"]["phase"], "open")
+            second = swarm.rollover_main_if_exhausted()
+            self.assertTrue(second["uncertain"])
+            self.assertEqual(len(opened), 1)
+
+    def test_uncertain_refresh_is_persisted_and_never_repeated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = FakeBridge()
+            bridge.tabs_data = [{
+                "id": 202, "windowId": 1, "index": 0, "title": "Worker",
+                "url": "https://chatgpt.com/c/worker-conv", "active": False,
+            }]
+            store = DurableStore(Path(tmp))
+            store.bind("implementer", {
+                "kind": "worker", "role": "implementer",
+                "conversation_id": "worker-conv",
+                "url_at_bind": "https://chatgpt.com/c/worker-conv",
+            })
+            swarm = SwarmRuntime(bridge=bridge, store=store)
+            bridge.inspect = lambda _id, tail=1: {
+                "ok": False, "browserState": "unresponsive", "error": "renderer unavailable"
+            }
+            called = []
+            def unknown_refresh(tab_id):
+                called.append(tab_id)
+                return {
+                    "ok": False, "mayHaveExecuted": True,
+                    "replacementTabId": 303, "error": "close ack lost"
+                }
+            bridge.refresh_tab = unknown_refresh
+            first = swarm.recover_unresponsive_binding("implementer")
+            self.assertTrue(first["uncertain"])
+            self.assertEqual(
+                store.bindings()["implementer"]["refresh_uncertain"]["replacement_tab_id"],
+                303
+            )
+            second = swarm.recover_unresponsive_binding("implementer")
+            self.assertTrue(second["uncertain"])
+            self.assertEqual(called, [202], "unknown refresh was retried")
 
     def test_plan_does_not_touch_browser(self):
         with tempfile.TemporaryDirectory() as tmp:

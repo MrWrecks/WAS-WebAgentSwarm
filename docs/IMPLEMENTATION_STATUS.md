@@ -1,43 +1,43 @@
 # Web Agent Swarm — implementation status
 
-Updated: 2026-11-16. Distinguish local verification from live-browser acceptance.
+Updated: 2026-11-16. This is an implementation record, not live deployment certification.
 
 ## Verified
-- Upstream: `yanchun2530/WAS-WebAgentSwarm` at `cf83412` (2026-09-17); MIT license.
-- Fork: `MrWrecks/WAS-WebAgentSwarm`, account-owned, public, with admin and push permission.
-- Windows development clone is isolated. Local `origin` is the fork; `upstream` is the original.
-- Git 2.55, Node 24.15, npm 11.12, Python 3.14 available; no CodexPro installed.
-- Baseline: 95 unit tests passed. Current: 107 Python unit tests pass; JS syntax and Git diff checks pass.
-- Fixed reconnect alarm constant and unsupported WebSocket host-permission patterns.
-- Scoped extension tab listings and automatic tab protection to reduce interference with unrelated browsing.
-- Added OS-held cross-process state locks; a live old lock cannot be stolen and a crashed writer frees its lock.
-- Replaced dangerous Windows `os.kill(pid, 0)` liveness check with non-destructive OS process-handle query; verified live child remains alive and exited child is detected.
-- Installed only locked `ws@8.21.3` to the isolated bridge directory with npm scripts disabled; a synthetic loopback smoke test passed authentication, WebSocket hello, tab forwarding, send acknowledgement and command-ID enforcement.
-- Isolated headless Microsoft Edge loaded the unpacked MV3 extension; verified its service worker, reconnect alarm, authenticated bridge connection, empty tab list, and automatic reconnection after a local bridge restart. No ChatGPT tabs were accessed.
-- Pre-persist browser send attempts with a tracked command ID; serialize storage writes; report unknown outcomes and stop blind coordinator retries.
-- All source modifications are confined to the separate development clone. No browser automation or persistent startup was enabled.
+- Upstream: `yanchun2530/WAS-WebAgentSwarm` at `cf83412` (2026-09-17), MIT license.
+- Account-owned public fork: `MrWrecks/WAS-WebAgentSwarm`; isolated development branch `fix/extension-connection-scope`, with fork `main` unchanged.
+- Development machine: Git 2.55, Node 24.15, npm 11.12, Python 3.14. CodexPro not installed.
+- Baseline: 95 Python tests. Current: **117 Python tests pass**, plus JavaScript syntax and Git diff checks.
+- Reconnect alarm, valid extension host permissions, reduced tab scope, and non-destructive passive tab observation.
+- Windows process liveness probes are non-destructive. Durable writer locks are OS-held; live writers cannot be mistaken for expired locks.
+- Extension command IDs require explicit tab IDs; SHA-256 fingerprints bind commands to exact tab/message/expected-URL tuples.
+- The extension writes an uncertain command reservation before browser submission. Concurrent duplicates are serialized; mismatched duplicates fail closed. Cache hydration/storage failures prevent new submissions.
+- The bridge binds pending results to the exact extension connection receiving a request; a second extension cannot forge the response. Disconnects and lost responses report uncertain open/close/send outcomes.
+- Bound Python sends pin the expected ChatGPT conversation URL, and the content script checks it before editing and immediately before clicking Send.
+- Close operations can pin an expected URL. Rollover debt cleanup checks original conversation identity and refuses to close reused IDs.
+- Uncertain rollover open/bootstrap operations and refresh replacement outcomes create durable holds rather than deleting possible live work or making blind retries.
+- Synthetic tests: `npm run test:smoke`, `npm run test:delivery`, `npm run test:recipient`; isolated headless Edge MV3 load and bridge-restart reconnect: `npm run test:extension`. These did not visit ChatGPT or access browser conversations.
+- Locked `ws@8.21.3` was installed only within the development copy, with package scripts disabled. No extension installed in a personal profile, no persistent service started, and no unrelated files changed.
 
 ## Not yet demonstrated
-- Browser extension installation and one manager/worker live round-trip.
-- Full message acknowledgment, worker result collection and safe replay after real browser restarts.
-- Six-worker concurrency, recovery, recipient isolation, and end-to-end reliability.
-- Full security review of browser bridge, token storage, and Windows installation scripts.
-- Operational installation or persistent Scheduled Task startup.
-- A supported/compliant method for automating ordinary ChatGPT web session output extraction.
+- A platform-authorized ChatGPT browser output integration, live manager-worker send and result collection, or a real session restart.
+- Safe six-worker operation under concurrent live ChatGPT sessions.
+- Full browser-bridge security, token-storage, and Windows scheduled-task installation reviews.
+- Reconciliation workflow for `rollover_uncertain` / `refresh_uncertain` durable holds.
+- Long-horizon idempotence: the extension result cache is bounded (256 entries). These tests prove replay safety only while a command remains in that cache, not perpetual exactly-once delivery.
 
-## Risks and approval gates
-- Platform terms may restrict automated collection of ChatGPT output. Verify a supported integration before live deployment.
-- Browser send acknowledgments are not proof of worker task completion.
-- A crash during browser submission now retains an uncertain send record. This prevents blind resends, but requires reconciliation with the intended conversation; delivery cannot be established from a timeout alone.
-- OS-held lock files intentionally remain on disk. Do not run old and new state-lock implementations concurrently during upgrade.
-- Windows installers can register and start persistent tasks with `-Force`; review existing tasks and obtain appropriate approval first.
-- CodexPro and any public local-command endpoint remain uninstalled and unexposed.
+## Material boundaries
+- OpenAI's Terms and supported integration mechanisms must be reviewed before automating extraction of ChatGPT website output. Synthetic/local tests are not authorization for live use.
+- An acknowledged browser send does not prove the worker completed its task.
+- An ambiguous consequential operation remains *unknown*. Inspect its actual state before any retry, cleanup, or marker removal.
+- OS-held state-lock files may remain on disk; do not run old and new writer-lock implementations simultaneously during a deployment transition.
+- Existing Windows task installers can register/start recurring tasks with `-Force`; review running tasks and obtain authorization before executing them.
+- CodexPro, remote command exposure, persistent startup, and live ChatGPT automation remain out of scope for this bounded development pass.
 
-## Next steps
-1. Maintain the separate development branch on the fork; do not modify its default branch.
-2. Verify the remaining browser scope, send-uncertainty and recipient-isolation cases using synthetic tests, without collecting ChatGPT output.
-3. Complete Windows startup, browser permission, and bridge security reviews before any live installation.
-4. Test one manager and one worker only after a supported, authorized browser communication method is established.
-5. Scale to six workers only after reliability gates pass.
+## Next acceptance gates
+1. Publish/verify this tested development branch on the fork, leaving `main` unchanged.
+2. Resolve platform-compliant chat automation, or choose a supported non-website integration.
+3. Finish credential/permission/startup review before any persistent installation.
+4. Validate one manager and worker with an authorized mechanism, including uncertain-result reconciliation.
+5. Scale only after reliable completion and recovery at the smaller scope.
 
-Rollback: a local Git branch records each change; the fork's default branch remains unchanged. Do not rewrite unrelated work.
+Rollback: local backup branches preserve prior commits; no forced history rewrite or changes to the fork's default branch.

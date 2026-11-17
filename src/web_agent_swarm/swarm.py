@@ -1270,6 +1270,7 @@ class SwarmRuntime:
         text: str,
         timeout: float = 20.0,
         command_id: str = "",
+        expected_url: str = "",
     ) -> Dict[str, object]:
         deadline = time.time() + max(1.0, float(timeout))
         active_command_id = str(command_id or "").strip() or uuid.uuid4().hex
@@ -1293,17 +1294,18 @@ class SwarmRuntime:
                         "error": "tab is generating",
                     }
             attempts += 1
-            last = self.bridge.send(
-                tab_id,
-                text,
-                command_id=active_command_id,
-            )
+            send_options = {"command_id": active_command_id}
+            if expected_url:
+                send_options["expected_url"] = expected_url
+            last = self.bridge.send(tab_id, text, **send_options)
             last["command_id"] = active_command_id
             last["attempts"] = attempts
             if last.get("ok"):
                 return last
             if last.get("mayHaveExecuted") or last.get("uncertain"):
                 last["uncertain"] = True
+                return last
+            if last.get("terminal") or last.get("duplicate"):
                 return last
             time.sleep(delay)
             delay = min(delay * 2.0, 2.0)
@@ -1535,7 +1537,9 @@ class SwarmRuntime:
                     "error": "worker tab is generating",
                 }
             if close_tab:
-                closed = self.bridge.close_tab(int(tab["id"]))
+                closed = self.bridge.close_tab(
+                    int(tab["id"]), expected_url=str(tab.get("url") or "")
+                )
                 if not closed.get("ok"):
                     return {
                         "ok": False,
@@ -2113,7 +2117,9 @@ class SwarmRuntime:
             "last_attempts": int(result.get("attempts") or 0),
             "last_latency_ms": int(max(0.0, elapsed_seconds) * 1000),
             "ack_timeout": bool(ack_timeout),
-            "may_have_executed": bool(ack_timeout),
+            "may_have_executed": bool(
+                ack_timeout or result.get("mayHaveExecuted") or result.get("uncertain")
+            ),
         }
         updated["send_health"] = health
         self.store.bind(clean_name, updated)
@@ -2137,6 +2143,7 @@ class SwarmRuntime:
             text,
             timeout=24.0,
             command_id=command_id,
+            expected_url=str(tab.get("url") or ""),
         )
         result["name"] = clean_name
         result["send_health"] = self._record_send_health(
@@ -2146,7 +2153,7 @@ class SwarmRuntime:
         status = (
             "ok" if result.get("ok")
             else "busy" if result.get("busy")
-            else "ack_timeout" if health.get("ack_timeout")
+            else "ack_timeout" if health.get("may_have_executed")
             else "failed"
         )
         result["send_transaction"] = self.store.send_transaction_record(
@@ -2159,11 +2166,44 @@ class SwarmRuntime:
         )
         return result
 
+    def _record_uncertain_rollover(
+        self, name: str, phase: str, outcome: Dict[str, object],
+        tab: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, object]:
+        """Preserve uncertain rollover work; never create or close another tab blindly."""
+        binding = dict(self.store.bindings().get(name) or {})
+        record = {
+            "phase": phase,
+            "tab_id": int((tab or {}).get("id") or 0),
+            "url": str((tab or {}).get("url") or ""),
+            "command_id": str(outcome.get("command_id") or ""),
+            "at": time.time(),
+        }
+        binding["rollover_uncertain"] = record
+        self.store.bind(name, binding)
+        return {
+            "ok": False,
+            "rolled_over": False,
+            "uncertain": True,
+            "pending_tab_id": record["tab_id"],
+            "command_id": record["command_id"],
+            "error": (
+                str(outcome.get("error") or "Rollover completion is unknown")
+                + "; reconcile the original browser tab before trying again."
+            ),
+        }
+
     def rollover_main_if_exhausted(self) -> Dict[str, object]:
         """Replace an exhausted main ChatGPT conversation without mutating durable work."""
         from .watchdogs import conversation_limit_reached
 
         old_binding = self.store.bindings().get("main")
+        if isinstance(old_binding, dict) and old_binding.get("rollover_uncertain"):
+            return {
+                "ok": False, "rolled_over": False, "uncertain": True,
+                "pending": old_binding["rollover_uncertain"],
+                "error": "Previous main rollover is uncertain; reconcile it before retrying.",
+            }
         old_tab = self._resolve("main")
         if not isinstance(old_binding, dict) or not old_tab:
             return {
@@ -2199,6 +2239,8 @@ class SwarmRuntime:
         opened = self.bridge.open_tab(target, active=False)
         new_tab = opened.get("tab") if opened.get("ok") else None
         if not new_tab:
+            if opened.get("mayHaveExecuted"):
+                return self._record_uncertain_rollover("main", "open", opened)
             return {
                 "ok": False,
                 "rolled_over": False,
@@ -2213,8 +2255,14 @@ class SwarmRuntime:
         )
         sent = self._send_when_ready(int(new_tab["id"]), prompt, timeout=10.0)
         if not sent.get("ok"):
+            if sent.get("mayHaveExecuted") or sent.get("uncertain"):
+                return self._record_uncertain_rollover(
+                    "main", "bootstrap_send", sent, new_tab
+                )
             try:
-                self.bridge.close_tab(int(new_tab["id"]))
+                self.bridge.close_tab(
+                    int(new_tab["id"]), expected_url=str(new_tab.get("url") or "")
+                )
             except Exception:
                 pass
             return {
@@ -2225,15 +2273,10 @@ class SwarmRuntime:
 
         stable = self._wait_conversation(int(new_tab["id"]), timeout=60.0)
         if not stable:
-            try:
-                self.bridge.close_tab(int(new_tab["id"]))
-            except Exception:
-                pass
-            return {
-                "ok": False,
-                "rolled_over": False,
-                "error": "fresh main conversation URL did not stabilize",
-            }
+            return self._record_uncertain_rollover(
+                "main", "conversation_url",
+                {"error": "Fresh main conversation URL did not stabilize"}, new_tab
+            )
 
         old_conversation_id = str(old_binding.get("conversation_id") or "")
         self._bind("main", stable, "main", "")
@@ -2245,7 +2288,9 @@ class SwarmRuntime:
         self.store.bind("main", updated)
 
         try:
-            closed = self.bridge.close_tab(int(old_tab["id"]))
+            closed = self.bridge.close_tab(
+                int(old_tab["id"]), expected_url=str(old_tab.get("url") or "")
+            )
         except Exception as exc:
             closed = {"ok": False, "error": str(exc)}
         self._record_rollover_close_result("main", int(old_tab["id"]), closed)
@@ -2282,7 +2327,9 @@ class SwarmRuntime:
 
     def cleanup_rollover_close_debt(self) -> Dict[str, object]:
         """Retry closing exhausted tabs left behind by a successful conversation rollover."""
-        tab_ids = {int(tab.get("id", -1)) for tab in self._tabs()}
+        tabs_by_id = {
+            int(tab.get("id", -1)): tab for tab in self._tabs()
+        }
         outcomes = []
         for name, binding in self.store.bindings().items():
             if not isinstance(binding, dict):
@@ -2290,11 +2337,23 @@ class SwarmRuntime:
             pending = int(binding.get("rollover_close_pending_tab_id") or 0)
             if pending <= 0:
                 continue
-            if pending not in tab_ids:
+            tab = tabs_by_id.get(pending)
+            if tab is None:
                 closed = {"ok": True, "already_closed": True, "tabId": pending}
+            elif (
+                not binding.get("rollover_from_conversation_id")
+                or conversation_id(str(tab.get("url") or ""))
+                != str(binding.get("rollover_from_conversation_id") or "")
+            ):
+                closed = {
+                    "ok": False, "tabId": pending,
+                    "error": "Pending tab ID now belongs to a different conversation; refusing to close."
+                }
             else:
                 try:
-                    closed = self.bridge.close_tab(pending)
+                    closed = self.bridge.close_tab(
+                        pending, expected_url=str(tab.get("url") or "")
+                    )
                 except Exception as exc:
                     closed = {"ok": False, "error": str(exc), "tabId": pending}
             self._record_rollover_close_result(str(name), pending, closed)
@@ -2351,7 +2410,9 @@ class SwarmRuntime:
                 skipped.append({"tab_id": tab_id, "conversation_id": cid, "reason": "not_idle"})
                 continue
             try:
-                result = self.bridge.close_tab(tab_id)
+                result = self.bridge.close_tab(
+                    tab_id, expected_url=str(tab.get("url") or "")
+                )
             except Exception as exc:
                 result = {"ok": False, "error": str(exc)}
             if result.get("ok"):
@@ -2385,6 +2446,12 @@ class SwarmRuntime:
         if not clean_name or clean_name == "main":
             return {"ok": False, "rolled_over": False, "error": "worker name is required"}
         old_binding = self.store.bindings().get(clean_name)
+        if isinstance(old_binding, dict) and old_binding.get("rollover_uncertain"):
+            return {
+                "ok": False, "rolled_over": False, "name": clean_name,
+                "uncertain": True, "pending": old_binding["rollover_uncertain"],
+                "error": "Previous worker rollover is uncertain; reconcile it before retrying.",
+            }
         old_tab = self._resolve(clean_name)
         if not isinstance(old_binding, dict) or old_binding.get("suspended") or not old_tab:
             return {
@@ -2426,6 +2493,11 @@ class SwarmRuntime:
         opened = self.bridge.open_tab(target, active=False)
         new_tab = opened.get("tab") if opened.get("ok") else None
         if not new_tab:
+            if opened.get("mayHaveExecuted"):
+                return {
+                    **self._record_uncertain_rollover(clean_name, "open", opened),
+                    "name": clean_name, "role": role,
+                }
             return {
                 "ok": False,
                 "rolled_over": False,
@@ -2444,8 +2516,17 @@ class SwarmRuntime:
         ).format(clean_name, role) + self._worker_prompt(role, clean_name)
         sent = self._send_when_ready(int(new_tab["id"]), prompt, timeout=10.0)
         if not sent.get("ok"):
+            if sent.get("mayHaveExecuted") or sent.get("uncertain"):
+                return {
+                    **self._record_uncertain_rollover(
+                        clean_name, "bootstrap_send", sent, new_tab
+                    ),
+                    "name": clean_name, "role": role,
+                }
             try:
-                self.bridge.close_tab(int(new_tab["id"]))
+                self.bridge.close_tab(
+                    int(new_tab["id"]), expected_url=str(new_tab.get("url") or "")
+                )
             except Exception:
                 pass
             return {
@@ -2457,16 +2538,12 @@ class SwarmRuntime:
             }
         stable = self._wait_conversation(int(new_tab["id"]), timeout=60.0)
         if not stable:
-            try:
-                self.bridge.close_tab(int(new_tab["id"]))
-            except Exception:
-                pass
             return {
-                "ok": False,
-                "rolled_over": False,
-                "name": clean_name,
-                "role": role,
-                "error": "fresh worker conversation URL did not stabilize",
+                **self._record_uncertain_rollover(
+                    clean_name, "conversation_url",
+                    {"error": "Fresh worker conversation URL did not stabilize"}, new_tab
+                ),
+                "name": clean_name, "role": role,
             }
 
         old_conversation_id = str(old_binding.get("conversation_id") or "")
@@ -2484,7 +2561,9 @@ class SwarmRuntime:
         self.store.bind(clean_name, updated)
 
         try:
-            closed = self.bridge.close_tab(int(old_tab["id"]))
+            closed = self.bridge.close_tab(
+                int(old_tab["id"]), expected_url=str(old_tab.get("url") or "")
+            )
         except Exception as exc:
             closed = {"ok": False, "error": str(exc)}
         self._record_rollover_close_result(clean_name, int(old_tab["id"]), closed)
@@ -2532,6 +2611,12 @@ class SwarmRuntime:
         binding = self.store.bindings().get(clean_name)
         if not clean_name or not isinstance(binding, dict):
             return {"ok": False, "reloaded": False, "error": "binding unavailable"}
+        if binding.get("refresh_uncertain"):
+            return {
+                "ok": False, "reloaded": False, "uncertain": True,
+                "name": clean_name, "pending": binding["refresh_uncertain"],
+                "error": "Previous refresh completion is unknown; reconcile before retrying.",
+            }
         if binding.get("suspended"):
             return {
                 "ok": True,
@@ -2571,6 +2656,21 @@ class SwarmRuntime:
 
         refreshed = self.bridge.refresh_tab(int(tab["id"]))
         if not refreshed.get("ok"):
+            if refreshed.get("mayHaveExecuted") or refreshed.get("uncertain"):
+                current = dict(self.store.bindings().get(clean_name) or binding)
+                current["refresh_uncertain"] = {
+                    "old_tab_id": int(tab["id"]),
+                    "replacement_tab_id": int(refreshed.get("replacementTabId") or 0),
+                    "conversation_id": original_cid,
+                    "at": time.time(),
+                }
+                self.store.bind(clean_name, current)
+                return {
+                    "ok": False, "reloaded": False, "uncertain": True,
+                    "name": clean_name, "pending": current["refresh_uncertain"],
+                    "error": refreshed.get("error") or "refresh completion unknown",
+                    "durable_ownership_mutated": False,
+                }
             return {
                 "ok": False,
                 "reloaded": False,

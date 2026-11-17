@@ -93,7 +93,7 @@ class BridgeClient:
             return {"ok": False, "http_status": exc.code, "error": str(exc)}
         except Exception as exc:
             result = {"ok": False, "error": "bridge unavailable: {0}".format(exc)}
-            if method == "POST" and path == "/send":
+            if method == "POST" and path in {"/send", "/open", "/close"}:
                 result["mayHaveExecuted"] = True
             return result
 
@@ -162,11 +162,14 @@ class BridgeClient:
         })
         return self._json("/inspect?" + query, timeout=7.0)
 
-    def close_tab(self, tab_id: int) -> Dict[str, object]:
+    def close_tab(self, tab_id: int, expected_url: str = "") -> Dict[str, object]:
+        payload = {"tabId": int(tab_id)}
+        if expected_url:
+            payload["expectedUrl"] = str(expected_url)
         return self._json(
             "/close",
             method="POST",
-            payload={"tabId": int(tab_id)},
+            payload=payload,
             timeout=9.0,
         )
 
@@ -203,15 +206,27 @@ class BridgeClient:
                 "ok": False,
                 "error": opened.get("error") or "failed to reopen ChatGPT conversation",
                 "tabId": target_id,
+                "mayHaveExecuted": bool(opened.get("mayHaveExecuted")),
+                "uncertain": bool(opened.get("mayHaveExecuted")),
             }
         new_id = int(new_tab.get("id", -1))
         if new_id < 0 or new_id == target_id:
             return {"ok": False, "error": "reopened ChatGPT tab id is invalid", "tabId": target_id}
 
-        closed = self.close_tab(target_id)
+        closed = self.close_tab(target_id, expected_url=url)
         if not closed.get("ok"):
-            # Fail closed: do not leave a duplicate replacement behind.
-            self.close_tab(new_id)
+            if closed.get("mayHaveExecuted"):
+                # The old tab may already be gone; do not delete its replacement.
+                return {
+                    "ok": False,
+                    "error": closed.get("error") or "old-tab close outcome unknown",
+                    "tabId": target_id,
+                    "replacementTabId": new_id,
+                    "mayHaveExecuted": True,
+                    "uncertain": True,
+                }
+            # Definitely failed before closing the old tab: undo the replacement.
+            self.close_tab(new_id, expected_url=str(new_tab.get("url") or ""))
             return {
                 "ok": False,
                 "error": closed.get("error") or "failed to close stale ChatGPT tab",
@@ -237,6 +252,7 @@ class BridgeClient:
         tab_id: int,
         text: str,
         command_id: str = "",
+        expected_url: str = "",
     ) -> Dict[str, object]:
         message = str(text or "").strip()
         if not message:
@@ -244,6 +260,8 @@ class BridgeClient:
         payload = {"tabId": int(tab_id), "text": message}
         clean_command_id = str(command_id or "").strip() or uuid.uuid4().hex
         payload["commandId"] = clean_command_id
+        if expected_url:
+            payload["expectedUrl"] = str(expected_url)
         result = self._json(
             "/send",
             method="POST",

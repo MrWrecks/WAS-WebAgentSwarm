@@ -55,7 +55,7 @@ async function main() {
   });
   let stderr = '';
   child.stderr.on('data', data => { stderr += data.toString().slice(0, 2000); });
-  let ws;
+  let ws, otherWs, heldRequest;
   const auth = { 'X-WAS-Token': token };
   try {
     let ready = false;
@@ -86,6 +86,10 @@ async function main() {
         }));
       }
       if (msg.type === 'send') {
+        if (msg.commandId === 'held-for-isolation-test') {
+          heldRequest = msg;
+          return;
+        }
         ws.send(JSON.stringify({
           type: 'send-result', id: msg.id, ok: true,
           commandId: msg.commandId, tabId: msg.tabId,
@@ -121,9 +125,48 @@ async function main() {
       body: JSON.stringify({ tabId: 42, text: 'invalid untracked send' }),
     });
     assert.equal(missingId.status, 400);
-    console.log('PASS: loopback auth, WebSocket handshake, tab routing, send ack, command ID gate');
+
+    const isolatedRequest = fetch(url + '/send', {
+      method: 'POST',
+      headers: { ...auth, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tabId: 42, commandId: 'held-for-isolation-test',
+        text: 'A request routed to first extension' }),
+    });
+    for (let attempt = 0; !heldRequest && attempt < 100; attempt++) await pause(10);
+    assert.ok(heldRequest, 'first extension did not receive the pending request');
+
+    otherWs = new WebSocket('ws://127.0.0.1:' + port + '/ws?token=' + token, {
+      origin: 'chrome-extension://another-synthetic-extension',
+    });
+    await once(otherWs, 'open');
+    const secondHandshake = nextMessage(otherWs, 'hello-ack');
+    otherWs.send(JSON.stringify({
+      type: 'hello', protocolMin: 5, protocolMax: 5,
+      extensionVersion: 'another-synthetic-test'
+    }));
+    assert.equal((await secondHandshake).ok, true);
+    const ambiguousProfiles = await fetch(url + '/tabs', {headers:auth});
+    assert.equal(ambiguousProfiles.status, 409, 'multiple profiles were not blocked');
+
+    let completed = false;
+    isolatedRequest.then(() => {completed = true;});
+    otherWs.send(JSON.stringify({
+      type: 'send-result', id: heldRequest.id, ok: true,
+      commandId: heldRequest.commandId
+    }));
+    await pause(140);
+    assert.equal(completed, false, 'another extension spoofed a pending response');
+
+    ws.terminate();
+    const disconnected = await isolatedRequest;
+    assert.equal(disconnected.status, 503,
+      'disconnected pending request was not immediately rejected');
+    const uncertain = await disconnected.json();
+    assert.equal(uncertain.mayHaveExecuted, true);
+    console.log('PASS: bridge auth, command ID, unique profile, response origin, disconnect uncertainty');
   } finally {
     ws?.terminate();
+    otherWs?.terminate();
     child.kill();
     await Promise.race([once(child, 'exit'), pause(2000)]);
   }

@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node server.js",
     "test:smoke": "node bridge-smoke.mjs",
-    "test:extension": "node extension-smoke.mjs"
+    "test:extension": "node extension-smoke.mjs",
+    "test:delivery": "node extension-delivery-test.mjs",
+    "test:recipient": "node content-target-test.mjs"
   },
   "dependencies": {
     "ws": "^8.18.3"
