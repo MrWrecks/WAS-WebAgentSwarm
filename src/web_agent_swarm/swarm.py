@@ -1322,9 +1322,39 @@ class SwarmRuntime:
     @staticmethod
     def _pid_alive(pid: int) -> bool:
         try:
-            os.kill(int(pid), 0)
+            pid = int(pid)
+        except (TypeError, ValueError):
+            return False
+        if pid <= 0:
+            return False
+        if os.name == "nt":
+            # os.kill(pid, 0) terminates a process on Windows; never use it as a probe.
+            import ctypes
+            from ctypes import wintypes
+
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            open_process = kernel.OpenProcess
+            open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            open_process.restype = wintypes.HANDLE
+            handle = open_process(0x00100000, False, pid)  # SYNCHRONIZE only
+            if not handle:
+                return ctypes.get_last_error() == 5  # Access denied: assume alive.
+            try:
+                wait = kernel.WaitForSingleObject
+                wait.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+                wait.restype = wintypes.DWORD
+                return wait(handle, 0) != 0  # WAIT_OBJECT_0 means exited.
+            finally:
+                close_handle = kernel.CloseHandle
+                close_handle.argtypes = (wintypes.HANDLE,)
+                close_handle.restype = wintypes.BOOL
+                close_handle(handle)
+        try:
+            os.kill(pid, 0)
             return True
-        except (OSError, ValueError):
+        except PermissionError:
+            return True
+        except OSError:
             return False
 
     def ensure_watcher(
